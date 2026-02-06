@@ -10,12 +10,69 @@ ini_set('post_max_size', '30M');
 ini_set('memory_limit', '512M');
 ini_set('max_execution_time', '300');
 
+// Security function: Sanitize filename
+function sanitizeFilename($filename) {
+    $filename = basename($filename);
+    $filename = preg_replace('/[^a-zA-Z0-9._-]/', '_', $filename);
+    $filename = preg_replace('/\.+/', '.', $filename);
+    $filename = ltrim($filename, '.');
+    if (strlen($filename) > 255) {
+        $filename = substr($filename, 0, 255);
+    }
+    return $filename ?: 'unnamed_file';
+}
+
+// Security function: Validate upload ID
+function validateUploadId($uploadId) {
+    return preg_match('/^[a-zA-Z0-9_]+$/', $uploadId) ? $uploadId : false;
+}
+
+// Security function: Validate chunk number
+function validateChunkNumber($chunk, $totalChunks) {
+    if (!is_numeric($chunk) || !is_numeric($totalChunks)) {
+        return false;
+    }
+    $chunk = intval($chunk);
+    $totalChunks = intval($totalChunks);
+    if ($chunk < 0 || $totalChunks < 1 || $chunk >= $totalChunks || $totalChunks > 1000) {
+        return false;
+    }
+    return true;
+}
+
+// Security function: Validate path is within directory
+function isPathSafe($filePath, $baseDir) {
+    $realBase = realpath($baseDir);
+    if ($realBase === false) {
+        return false;
+    }
+    
+    // Check if file exists
+    if (file_exists($filePath)) {
+        $realPath = realpath($filePath);
+        if ($realPath === false) {
+            return false;
+        }
+    } else {
+        // For new files, check parent directory
+        $parentDir = dirname($filePath);
+        $realParent = realpath($parentDir);
+        if ($realParent === false) {
+            return false;
+        }
+        $realPath = $realParent . DIRECTORY_SEPARATOR . basename($filePath);
+    }
+    
+    // Ensure path starts with base directory
+    return strpos($realPath, $realBase . DIRECTORY_SEPARATOR) === 0;
+}
+
 // Handle login
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
     if ($_POST['password'] === $correctPassword) {
         $_SESSION['logged_in'] = true;
         if (isset($_POST['remember'])) {
-            setcookie('transfer_auth', md5($correctPassword), time() + (30 * 24 * 60 * 60), '/');
+            setcookie('transfer_auth', hash('sha256', $correctPassword . 'salt'), time() + (30 * 24 * 60 * 60), '/', '', true, true);
         }
         header('Location: ' . $_SERVER['PHP_SELF']);
         exit;
@@ -27,13 +84,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
 // Handle logout
 if (isset($_GET['logout'])) {
     session_destroy();
-    setcookie('transfer_auth', '', time() - 3600, '/');
+    setcookie('transfer_auth', '', time() - 3600, '/', '', true, true);
     header('Location: ' . $_SERVER['PHP_SELF']);
     exit;
 }
 
 // Check authentication
-$isLoggedIn = isset($_SESSION['logged_in']) || (isset($_COOKIE['transfer_auth']) && $_COOKIE['transfer_auth'] === md5($correctPassword));
+$isLoggedIn = isset($_SESSION['logged_in']) || (isset($_COOKIE['transfer_auth']) && $_COOKIE['transfer_auth'] === hash('sha256', $correctPassword . 'salt'));
 
 if (!$isLoggedIn) {
     ?>
@@ -78,67 +135,157 @@ if (!$isLoggedIn) {
 }
 
 // Main application code
-$uploadDir = 'uploads/';
-$chunksDir = 'uploads/chunks/';
-$textFile = 'uploads/texts.json';
-if (!is_dir($uploadDir)) mkdir($uploadDir, 0777, true);
-if (!is_dir($chunksDir)) mkdir($chunksDir, 0777, true);
+$uploadDir = realpath(__DIR__ . '/uploads') . DIRECTORY_SEPARATOR;
+$chunksDir = realpath(__DIR__ . '/uploads/chunks') . DIRECTORY_SEPARATOR;
+$textFile = $uploadDir . 'texts.json';
+
+// Ensure directories exist
+if (!is_dir($uploadDir)) {
+    mkdir($uploadDir, 0755, true);
+    file_put_contents($uploadDir . '.htaccess', 'Options -Indexes');
+}
+if (!is_dir($chunksDir)) {
+    mkdir($chunksDir, 0755, true);
+    file_put_contents($chunksDir . '.htaccess', 'deny from all');
+}
+
+// Re-get real paths after creation
+$uploadDir = realpath(__DIR__ . '/uploads') . DIRECTORY_SEPARATOR;
+$chunksDir = realpath(__DIR__ . '/uploads/chunks') . DIRECTORY_SEPARATOR;
+$textFile = $uploadDir . 'texts.json';
 
 // Handle chunked upload
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk'])) {
     header('Content-Type: application/json');
     
-    $chunk = $_POST['chunk'];
-    $totalChunks = $_POST['totalChunks'];
-    $fileName = $_POST['fileName'];
-    $uploadId = $_POST['uploadId'];
+    // Validate and sanitize inputs
+    $chunk = isset($_POST['chunk']) ? intval($_POST['chunk']) : -1;
+    $totalChunks = isset($_POST['totalChunks']) ? intval($_POST['totalChunks']) : -1;
+    $fileName = isset($_POST['fileName']) ? sanitizeFilename($_POST['fileName']) : '';
+    $uploadId = isset($_POST['uploadId']) ? validateUploadId($_POST['uploadId']) : false;
     
-    $chunkFile = $chunksDir . $uploadId . '_' . $chunk;
+    // Validation checks
+    if (!$uploadId) {
+        echo json_encode(['success' => false, 'error' => 'Invalid upload ID']);
+        exit;
+    }
+    
+    if (!validateChunkNumber($chunk, $totalChunks)) {
+        echo json_encode(['success' => false, 'error' => 'Invalid chunk number']);
+        exit;
+    }
+    
+    if (empty($fileName)) {
+        echo json_encode(['success' => false, 'error' => 'Invalid filename']);
+        exit;
+    }
+    
+    // Build safe chunk file path with sanitized uploadId
+    $safeUploadId = preg_replace('/[^a-zA-Z0-9_]/', '', $uploadId);
+    $chunkFileName = $safeUploadId . '_' . $chunk;
+    $chunkFile = $chunksDir . $chunkFileName;
+    
+    // Verify chunk path safety
+    if (!isPathSafe($chunkFile, $chunksDir)) {
+        echo json_encode(['success' => false, 'error' => 'Invalid chunk path']);
+        exit;
+    }
     
     if (isset($_FILES['file']) && $_FILES['file']['error'] === UPLOAD_ERR_OK) {
-        move_uploaded_file($_FILES['file']['tmp_name'], $chunkFile);
-        
-        // Check if all chunks uploaded
-        $allChunksUploaded = true;
-        for ($i = 0; $i < $totalChunks; $i++) {
-            if (!file_exists($chunksDir . $uploadId . '_' . $i)) {
-                $allChunksUploaded = false;
-                break;
-            }
+        // Additional file validation
+        if ($_FILES['file']['size'] > 20 * 1024 * 1024) {
+            echo json_encode(['success' => false, 'error' => 'Chunk too large']);
+            exit;
         }
         
-        if ($allChunksUploaded) {
-            // Combine chunks
-            $finalFile = $uploadDir . $fileName;
+        if (move_uploaded_file($_FILES['file']['tmp_name'], $chunkFile)) {
+            // Check if all chunks uploaded
+            $allChunksUploaded = true;
+            $chunkPaths = [];
             
-            // Handle duplicate names
-            if (file_exists($finalFile)) {
-                $fileInfo = pathinfo($fileName);
-                $baseName = $fileInfo['filename'];
-                $extension = isset($fileInfo['extension']) ? '.' . $fileInfo['extension'] : '';
-                $counter = 1;
+            for ($i = 0; $i < $totalChunks; $i++) {
+                $checkChunkName = $safeUploadId . '_' . $i;
+                $checkChunk = $chunksDir . $checkChunkName;
                 
-                while (file_exists($uploadDir . $baseName . '_' . $counter . $extension)) {
-                    $counter++;
+                // Verify each chunk path
+                if (!isPathSafe($checkChunk, $chunksDir) || !file_exists($checkChunk)) {
+                    $allChunksUploaded = false;
+                    break;
+                }
+                $chunkPaths[] = $checkChunk;
+            }
+            
+            if ($allChunksUploaded) {
+                // Determine final file path
+                $finalFileName = $fileName;
+                $finalFile = $uploadDir . $finalFileName;
+                
+                // Handle duplicate names
+                if (file_exists($finalFile)) {
+                    $fileInfo = pathinfo($fileName);
+                    $baseName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $fileInfo['filename']);
+                    $extension = isset($fileInfo['extension']) ? '.' . preg_replace('/[^a-zA-Z0-9]/', '', $fileInfo['extension']) : '';
+                    $counter = 1;
+                    
+                    do {
+                        $finalFileName = $baseName . '_' . $counter . $extension;
+                        $finalFile = $uploadDir . $finalFileName;
+                        $counter++;
+                    } while (file_exists($finalFile) && $counter < 1000);
                 }
                 
-                $finalFile = $uploadDir . $baseName . '_' . $counter . $extension;
+                // Final path safety check
+                if (!isPathSafe($finalFile, $uploadDir)) {
+                    echo json_encode(['success' => false, 'error' => 'Invalid final path']);
+                    exit;
+                }
+                
+                // Combine chunks into final file
+                $output = fopen($finalFile, 'wb');
+                if ($output === false) {
+                    echo json_encode(['success' => false, 'error' => 'Cannot create file']);
+                    exit;
+                }
+                
+                $success = true;
+                foreach ($chunkPaths as $chunkPath) {
+                    // Double-check path safety before opening
+                    if (!isPathSafe($chunkPath, $chunksDir)) {
+                        $success = false;
+                        break;
+                    }
+                    
+                    $input = fopen($chunkPath, 'rb');
+                    if ($input === false) {
+                        $success = false;
+                        break;
+                    }
+                    
+                    stream_copy_to_stream($input, $output);
+                    fclose($input);
+                    
+                    // Verify path before deletion
+                    if (isPathSafe($chunkPath, $chunksDir)) {
+                        unlink($chunkPath);
+                    }
+                }
+                
+                fclose($output);
+                
+                if ($success) {
+                    echo json_encode(['success' => true, 'completed' => true]);
+                } else {
+                    // Clean up partial file
+                    if (file_exists($finalFile) && isPathSafe($finalFile, $uploadDir)) {
+                        unlink($finalFile);
+                    }
+                    echo json_encode(['success' => false, 'error' => 'Combination failed']);
+                }
+            } else {
+                echo json_encode(['success' => true, 'completed' => false]);
             }
-            
-            // Combine chunks into final file
-            $output = fopen($finalFile, 'wb');
-            for ($i = 0; $i < $totalChunks; $i++) {
-                $chunkPath = $chunksDir . $uploadId . '_' . $i;
-                $input = fopen($chunkPath, 'rb');
-                stream_copy_to_stream($input, $output);
-                fclose($input);
-                unlink($chunkPath); // Delete chunk
-            }
-            fclose($output);
-            
-            echo json_encode(['success' => true, 'completed' => true]);
         } else {
-            echo json_encode(['success' => true, 'completed' => false]);
+            echo json_encode(['success' => false, 'error' => 'Move failed']);
         }
     } else {
         echo json_encode(['success' => false, 'error' => 'Upload failed']);
@@ -148,46 +295,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk'])) {
 
 // Load saved texts
 $texts = file_exists($textFile) ? json_decode(file_get_contents($textFile), true) : [];
+if (!is_array($texts)) $texts = [];
 
 // Auto-delete files and texts older than 3 days
 $threeDaysAgo = time() - (3 * 24 * 60 * 60);
 
 // Clean old files
-$allFiles = array_diff(scandir($uploadDir), ['.', '..', 'texts.json', 'chunks']);
-foreach ($allFiles as $file) {
-    $filePath = $uploadDir . $file;
-    if (is_file($filePath) && filemtime($filePath) < $threeDaysAgo) {
-        unlink($filePath);
+if (is_dir($uploadDir)) {
+    $allFiles = array_diff(scandir($uploadDir), ['.', '..', 'texts.json', 'chunks', '.htaccess']);
+    foreach ($allFiles as $file) {
+        $filePath = $uploadDir . $file;
+        if (is_file($filePath) && isPathSafe($filePath, $uploadDir) && filemtime($filePath) < $threeDaysAgo) {
+            unlink($filePath);
+        }
     }
 }
 
-// Clean old chunks (older than 1 hour - incomplete uploads)
+// Clean old chunks (older than 1 hour)
 $oneHourAgo = time() - 3600;
-$chunkFiles = array_diff(scandir($chunksDir), ['.', '..']);
-foreach ($chunkFiles as $chunk) {
-    $chunkPath = $chunksDir . $chunk;
-    if (filemtime($chunkPath) < $oneHourAgo) {
-        unlink($chunkPath);
+if (is_dir($chunksDir)) {
+    $chunkFiles = array_diff(scandir($chunksDir), ['.', '..', '.htaccess']);
+    foreach ($chunkFiles as $chunk) {
+        $chunkPath = $chunksDir . $chunk;
+        if (is_file($chunkPath) && isPathSafe($chunkPath, $chunksDir) && filemtime($chunkPath) < $oneHourAgo) {
+            unlink($chunkPath);
+        }
     }
 }
 
 // Clean old texts
 $texts = array_filter($texts, function($item) use ($threeDaysAgo) {
-    return $item['time'] >= $threeDaysAgo;
+    return isset($item['time']) && $item['time'] >= $threeDaysAgo;
 });
 file_put_contents($textFile, json_encode(array_values($texts)));
 
 // Handle text/URL save
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['text'])) {
-    $text = $_POST['text'];
-    $texts[] = ['time' => time(), 'content' => $text];
-    file_put_contents($textFile, json_encode($texts));
-    $message = "✅ Text saved!";
+    $text = isset($_POST['text']) ? substr(trim($_POST['text']), 0, 10000) : '';
+    if (!empty($text)) {
+        $texts[] = ['time' => time(), 'content' => $text];
+        file_put_contents($textFile, json_encode($texts));
+        $message = "✅ Text saved!";
+    }
 }
 
 // Get all files
-$files = array_diff(scandir($uploadDir), ['.', '..', 'texts.json', 'chunks']);
-arsort($files);
+$files = [];
+if (is_dir($uploadDir)) {
+    $files = array_diff(scandir($uploadDir), ['.', '..', 'texts.json', 'chunks', '.htaccess']);
+    arsort($files);
+}
 
 // Function to format file size
 function formatFileSize($bytes) {
@@ -204,11 +361,12 @@ function formatFileSize($bytes) {
 
 // Get current URL
 $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? "https://" : "http://";
-$currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
+$currentURL = htmlspecialchars($protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'], ENT_QUOTES, 'UTF-8');
 ?>
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>⚡ Fast Transfer</title>
     <style>
@@ -271,7 +429,7 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
         <div class="info">🗑️ Files auto-delete after 3 days • 📦 Supports files up to 200MB • ⚡ 3 parallel uploads</div>
         
         <?php if (isset($message)): ?>
-            <div class="message"><?= $message ?></div>
+            <div class="message"><?= htmlspecialchars($message, ENT_QUOTES, 'UTF-8') ?></div>
         <?php endif; ?>
 
         <div class="section">
@@ -292,7 +450,7 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
         <div class="section">
             <h2>📝 Save Text or URL</h2>
             <form method="POST">
-                <textarea name="text" placeholder="Paste text or URL here..." required></textarea>
+                <textarea name="text" placeholder="Paste text or URL here..." required maxlength="10000"></textarea>
                 <button type="submit">Save Text</button>
             </form>
         </div>
@@ -302,20 +460,22 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
             <h2>📋 Saved Texts (<?= count($texts) ?>)</h2>
             <div class="texts-grid">
                 <?php foreach (array_reverse($texts) as $index => $item): ?>
+                    <?php if (isset($item['content'])): ?>
                     <div class="text-item">
-                        <button class="copy-btn" onclick="copyText(this, <?= $index ?>)">
+                        <button class="copy-btn" onclick="copyText(this, <?= $index ?>)" aria-label="Copy text">
                             <svg fill="currentColor" viewBox="0 0 24 24">
                                 <path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
                             </svg>
                         </button>
                         <div class="text-content">
                             <?php
-                            $content = htmlspecialchars($item['content']);
+                            $content = htmlspecialchars($item['content'], ENT_QUOTES, 'UTF-8');
                             echo strlen($content) > 150 ? substr($content, 0, 150) . '...' : $content;
                             ?>
                         </div>
-                        <textarea id="full-text-<?= $index ?>" style="display:none;"><?= htmlspecialchars($item['content']) ?></textarea>
+                        <textarea id="full-text-<?= $index ?>" style="display:none;"><?= htmlspecialchars($item['content'], ENT_QUOTES, 'UTF-8') ?></textarea>
                     </div>
+                    <?php endif; ?>
                 <?php endforeach; ?>
             </div>
         </div>
@@ -326,6 +486,8 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
             <div class="files">
                 <?php foreach ($files as $file): 
                     $filePath = $uploadDir . $file;
+                    if (!is_file($filePath) || !isPathSafe($filePath, $uploadDir)) continue;
+                    
                     $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
                     $fileSize = formatFileSize(filesize($filePath));
                     $fileType = strtoupper($ext);
@@ -334,17 +496,20 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
                     $videoExts = ['mp4', 'webm', 'ogg', 'mov', 'avi'];
                     $pdfExts = ['pdf'];
                     $audioExts = ['mp3', 'wav', 'ogg', 'aac'];
+                    
+                    // Build relative path for display
+                    $relPath = 'uploads/' . htmlspecialchars($file, ENT_QUOTES, 'UTF-8');
                 ?>
                     <div class="file-card">
                         <div class="file-preview">
                             <?php if (in_array($ext, $imageExts)): ?>
-                                <img src="<?= $filePath ?>" alt="<?= $file ?>">
+                                <img src="<?= $relPath ?>" alt="<?= htmlspecialchars($file, ENT_QUOTES, 'UTF-8') ?>">
                             <?php elseif (in_array($ext, $videoExts)): ?>
                                 <video controls>
-                                    <source src="<?= $filePath ?>" type="video/<?= $ext ?>">
+                                    <source src="<?= $relPath ?>" type="video/<?= htmlspecialchars($ext, ENT_QUOTES, 'UTF-8') ?>">
                                 </video>
                             <?php elseif (in_array($ext, $pdfExts)): ?>
-                                <iframe src="<?= $filePath ?>#toolbar=0" type="application/pdf"></iframe>
+                                <iframe src="<?= $relPath ?>#toolbar=0" type="application/pdf"></iframe>
                             <?php elseif (in_array($ext, $audioExts)): ?>
                                 <div class="file-icon">🎵</div>
                             <?php elseif ($ext === 'doc' || $ext === 'docx'): ?>
@@ -356,9 +521,9 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
                             <?php endif; ?>
                         </div>
                         <div class="file-info">
-                            <div class="file-name" title="<?= htmlspecialchars($file) ?>"><?= htmlspecialchars($file) ?></div>
-                            <div class="file-meta"><?= $fileType ?> • <?= $fileSize ?></div>
-                            <a href="<?= $filePath ?>" download class="download-btn">Download</a>
+                            <div class="file-name" title="<?= htmlspecialchars($file, ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars($file, ENT_QUOTES, 'UTF-8') ?></div>
+                            <div class="file-meta"><?= htmlspecialchars($fileType, ENT_QUOTES, 'UTF-8') ?> • <?= htmlspecialchars($fileSize, ENT_QUOTES, 'UTF-8') ?></div>
+                            <a href="<?= $relPath ?>" download class="download-btn">Download</a>
                         </div>
                     </div>
                 <?php endforeach; ?>
@@ -367,11 +532,18 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
     </div>
 
     <script>
-        const CHUNK_SIZE = 15 * 1024 * 1024; // 15MB chunks
-        const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB threshold
-        const MAX_PARALLEL = 3; // Upload 3 files at once
+        const CHUNK_SIZE = 15 * 1024 * 1024;
+        const MAX_FILE_SIZE = 20 * 1024 * 1024;
+        const MAX_PARALLEL = 3;
 
-        // Show selected file count
+        function sanitizeFilename(filename) {
+            return filename.replace(/[^a-zA-Z0-9._-]/g, '_').substring(0, 255);
+        }
+
+        function generateUploadId() {
+            return Date.now() + '_' + Math.random().toString(36).substr(2, 9).replace(/[^a-z0-9]/gi, '');
+        }
+
         document.getElementById('fileInput').addEventListener('change', function(e) {
             const count = e.target.files.length;
             const countDiv = document.getElementById('fileCount');
@@ -382,7 +554,6 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
             }
         });
 
-        // Handle file upload with parallel processing
         document.getElementById('uploadForm').addEventListener('submit', async function(e) {
             e.preventDefault();
             
@@ -404,7 +575,6 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
             
             const startTime = Date.now();
             
-            // Update overall progress
             const updateProgress = () => {
                 let totalProgress = 0;
                 fileProgress.forEach(progress => {
@@ -414,13 +584,11 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
                 progressFill.style.width = overallProgress + '%';
                 progressFill.textContent = overallProgress + '%';
                 
-                // Calculate speed
                 const elapsedSeconds = (Date.now() - startTime) / 1000;
                 const filesPerSecond = (completedFiles / elapsedSeconds).toFixed(2);
                 uploadSpeed.textContent = `⚡ ${completedFiles}/${totalFiles} files • ${filesPerSecond} files/sec`;
             };
             
-            // Upload files in batches of MAX_PARALLEL
             for (let i = 0; i < totalFiles; i += MAX_PARALLEL) {
                 const batch = files.slice(i, i + MAX_PARALLEL);
                 
@@ -430,13 +598,11 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
                     
                     try {
                         if (file.size > MAX_FILE_SIZE) {
-                            // Upload in chunks
                             await uploadFileInChunks(file, (progress) => {
                                 fileProgress.set(fileIndex, progress);
                                 updateProgress();
                             });
                         } else {
-                            // Direct upload
                             await uploadFileDirect(file);
                             fileProgress.set(fileIndex, 1);
                         }
@@ -450,7 +616,6 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
                 }));
             }
             
-            // Success
             uploadSpeed.textContent = `✅ Completed ${completedFiles}/${totalFiles} files`;
             setTimeout(() => {
                 location.reload();
@@ -459,7 +624,8 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
 
         async function uploadFileInChunks(file, progressCallback) {
             const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-            const uploadId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+            const uploadId = generateUploadId();
+            const sanitizedName = sanitizeFilename(file.name);
             
             for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
                 const start = chunkIndex * CHUNK_SIZE;
@@ -470,7 +636,7 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
                 formData.append('file', chunk);
                 formData.append('chunk', chunkIndex);
                 formData.append('totalChunks', totalChunks);
-                formData.append('fileName', file.name);
+                formData.append('fileName', sanitizedName);
                 formData.append('uploadId', uploadId);
                 
                 const response = await fetch(window.location.href, {
@@ -489,12 +655,13 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
         }
 
         async function uploadFileDirect(file) {
+            const sanitizedName = sanitizeFilename(file.name);
             const formData = new FormData();
             formData.append('file', file);
             formData.append('chunk', 0);
             formData.append('totalChunks', 1);
-            formData.append('fileName', file.name);
-            formData.append('uploadId', Date.now() + '_' + Math.random().toString(36).substr(2, 9));
+            formData.append('fileName', sanitizedName);
+            formData.append('uploadId', generateUploadId());
             
             const response = await fetch(window.location.href, {
                 method: 'POST',
@@ -510,6 +677,8 @@ $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
 
         function copyText(btn, index) {
             const textarea = document.getElementById('full-text-' + index);
+            if (!textarea) return;
+            
             textarea.style.display = 'block';
             textarea.select();
             document.execCommand('copy');
