@@ -10,6 +10,12 @@ ini_set('post_max_size', '30M');
 ini_set('memory_limit', '512M');
 ini_set('max_execution_time', '300');
 
+// Security function: Get safe redirect URL
+function getSafeRedirectUrl() {
+    // Use only the script name, no path info
+    return basename($_SERVER['SCRIPT_NAME']);
+}
+
 // Security function: Sanitize filename
 function sanitizeFilename($filename) {
     $filename = basename($filename);
@@ -47,14 +53,12 @@ function isPathSafe($filePath, $baseDir) {
         return false;
     }
     
-    // Check if file exists
     if (file_exists($filePath)) {
         $realPath = realpath($filePath);
         if ($realPath === false) {
             return false;
         }
     } else {
-        // For new files, check parent directory
         $parentDir = dirname($filePath);
         $realParent = realpath($parentDir);
         if ($realParent === false) {
@@ -63,7 +67,6 @@ function isPathSafe($filePath, $baseDir) {
         $realPath = $realParent . DIRECTORY_SEPARATOR . basename($filePath);
     }
     
-    // Ensure path starts with base directory
     return strpos($realPath, $realBase . DIRECTORY_SEPARATOR) === 0;
 }
 
@@ -74,7 +77,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
         if (isset($_POST['remember'])) {
             setcookie('transfer_auth', hash('sha256', $correctPassword . 'salt'), time() + (30 * 24 * 60 * 60), '/', '', true, true);
         }
-        header('Location: ' . $_SERVER['PHP_SELF']);
+        header('Location: ' . getSafeRedirectUrl());
         exit;
     } else {
         $loginError = true;
@@ -85,7 +88,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
 if (isset($_GET['logout'])) {
     session_destroy();
     setcookie('transfer_auth', '', time() - 3600, '/', '', true, true);
-    header('Location: ' . $_SERVER['PHP_SELF']);
+    header('Location: ' . getSafeRedirectUrl());
     exit;
 }
 
@@ -97,6 +100,7 @@ if (!$isLoggedIn) {
     <!DOCTYPE html>
     <html>
     <head>
+        <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>🔒 Login - Fast Transfer</title>
         <style>
@@ -158,13 +162,11 @@ $textFile = $uploadDir . 'texts.json';
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk'])) {
     header('Content-Type: application/json');
     
-    // Validate and sanitize inputs
     $chunk = isset($_POST['chunk']) ? intval($_POST['chunk']) : -1;
     $totalChunks = isset($_POST['totalChunks']) ? intval($_POST['totalChunks']) : -1;
     $fileName = isset($_POST['fileName']) ? sanitizeFilename($_POST['fileName']) : '';
     $uploadId = isset($_POST['uploadId']) ? validateUploadId($_POST['uploadId']) : false;
     
-    // Validation checks
     if (!$uploadId) {
         echo json_encode(['success' => false, 'error' => 'Invalid upload ID']);
         exit;
@@ -180,26 +182,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk'])) {
         exit;
     }
     
-    // Build safe chunk file path with sanitized uploadId
     $safeUploadId = preg_replace('/[^a-zA-Z0-9_]/', '', $uploadId);
     $chunkFileName = $safeUploadId . '_' . $chunk;
     $chunkFile = $chunksDir . $chunkFileName;
     
-    // Verify chunk path safety
     if (!isPathSafe($chunkFile, $chunksDir)) {
         echo json_encode(['success' => false, 'error' => 'Invalid chunk path']);
         exit;
     }
     
     if (isset($_FILES['file']) && $_FILES['file']['error'] === UPLOAD_ERR_OK) {
-        // Additional file validation
         if ($_FILES['file']['size'] > 20 * 1024 * 1024) {
             echo json_encode(['success' => false, 'error' => 'Chunk too large']);
             exit;
         }
         
         if (move_uploaded_file($_FILES['file']['tmp_name'], $chunkFile)) {
-            // Check if all chunks uploaded
             $allChunksUploaded = true;
             $chunkPaths = [];
             
@@ -207,7 +205,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk'])) {
                 $checkChunkName = $safeUploadId . '_' . $i;
                 $checkChunk = $chunksDir . $checkChunkName;
                 
-                // Verify each chunk path
                 if (!isPathSafe($checkChunk, $chunksDir) || !file_exists($checkChunk)) {
                     $allChunksUploaded = false;
                     break;
@@ -216,11 +213,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk'])) {
             }
             
             if ($allChunksUploaded) {
-                // Determine final file path
                 $finalFileName = $fileName;
                 $finalFile = $uploadDir . $finalFileName;
                 
-                // Handle duplicate names
                 if (file_exists($finalFile)) {
                     $fileInfo = pathinfo($fileName);
                     $baseName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $fileInfo['filename']);
@@ -234,13 +229,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk'])) {
                     } while (file_exists($finalFile) && $counter < 1000);
                 }
                 
-                // Final path safety check
                 if (!isPathSafe($finalFile, $uploadDir)) {
                     echo json_encode(['success' => false, 'error' => 'Invalid final path']);
                     exit;
                 }
                 
-                // Combine chunks into final file
                 $output = fopen($finalFile, 'wb');
                 if ($output === false) {
                     echo json_encode(['success' => false, 'error' => 'Cannot create file']);
@@ -249,7 +242,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk'])) {
                 
                 $success = true;
                 foreach ($chunkPaths as $chunkPath) {
-                    // Double-check path safety before opening
                     if (!isPathSafe($chunkPath, $chunksDir)) {
                         $success = false;
                         break;
@@ -264,7 +256,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk'])) {
                     stream_copy_to_stream($input, $output);
                     fclose($input);
                     
-                    // Verify path before deletion
                     if (isPathSafe($chunkPath, $chunksDir)) {
                         unlink($chunkPath);
                     }
@@ -275,7 +266,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk'])) {
                 if ($success) {
                     echo json_encode(['success' => true, 'completed' => true]);
                 } else {
-                    // Clean up partial file
                     if (file_exists($finalFile) && isPathSafe($finalFile, $uploadDir)) {
                         unlink($finalFile);
                     }
@@ -327,7 +317,9 @@ if (is_dir($chunksDir)) {
 $texts = array_filter($texts, function($item) use ($threeDaysAgo) {
     return isset($item['time']) && $item['time'] >= $threeDaysAgo;
 });
-file_put_contents($textFile, json_encode(array_values($texts)));
+// Re-index array to ensure sequential numeric keys
+$texts = array_values($texts);
+file_put_contents($textFile, json_encode($texts));
 
 // Handle text/URL save
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['text'])) {
@@ -361,13 +353,16 @@ function formatFileSize($bytes) {
 
 // Get current URL
 $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? "https://" : "http://";
-$currentURL = htmlspecialchars($protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'], ENT_QUOTES, 'UTF-8');
+$host = htmlspecialchars($_SERVER['HTTP_HOST'], ENT_QUOTES, 'UTF-8');
+$script = htmlspecialchars(basename($_SERVER['SCRIPT_NAME']), ENT_QUOTES, 'UTF-8');
+$currentURL = $protocol . $host . '/' . $script;
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <title>⚡ Fast Transfer</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -460,9 +455,13 @@ $currentURL = htmlspecialchars($protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQ
             <h2>📋 Saved Texts (<?= count($texts) ?>)</h2>
             <div class="texts-grid">
                 <?php foreach (array_reverse($texts) as $index => $item): ?>
-                    <?php if (isset($item['content'])): ?>
+                    <?php 
+                    // Ensure index is a safe integer
+                    $safeIndex = intval($index);
+                    if (isset($item['content']) && is_string($item['content'])): 
+                    ?>
                     <div class="text-item">
-                        <button class="copy-btn" onclick="copyText(this, <?= $index ?>)" aria-label="Copy text">
+                        <button class="copy-btn" data-index="<?= $safeIndex ?>" aria-label="Copy text">
                             <svg fill="currentColor" viewBox="0 0 24 24">
                                 <path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
                             </svg>
@@ -470,10 +469,10 @@ $currentURL = htmlspecialchars($protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQ
                         <div class="text-content">
                             <?php
                             $content = htmlspecialchars($item['content'], ENT_QUOTES, 'UTF-8');
-                            echo strlen($content) > 150 ? substr($content, 0, 150) . '...' : $content;
+                            echo mb_strlen($content) > 150 ? mb_substr($content, 0, 150) . '...' : $content;
                             ?>
                         </div>
-                        <textarea id="full-text-<?= $index ?>" style="display:none;"><?= htmlspecialchars($item['content'], ENT_QUOTES, 'UTF-8') ?></textarea>
+                        <textarea id="full-text-<?= $safeIndex ?>" style="display:none;" readonly><?= htmlspecialchars($item['content'], ENT_QUOTES, 'UTF-8') ?></textarea>
                     </div>
                     <?php endif; ?>
                 <?php endforeach; ?>
@@ -497,7 +496,6 @@ $currentURL = htmlspecialchars($protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQ
                     $pdfExts = ['pdf'];
                     $audioExts = ['mp3', 'wav', 'ogg', 'aac'];
                     
-                    // Build relative path for display
                     $relPath = 'uploads/' . htmlspecialchars($file, ENT_QUOTES, 'UTF-8');
                 ?>
                     <div class="file-card">
@@ -548,7 +546,7 @@ $currentURL = htmlspecialchars($protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQ
             const count = e.target.files.length;
             const countDiv = document.getElementById('fileCount');
             if (count > 0) {
-                countDiv.textContent = `📁 ${count} file(s) selected`;
+                countDiv.textContent = '📁 ' + count + ' file(s) selected';
             } else {
                 countDiv.textContent = '';
             }
@@ -586,7 +584,7 @@ $currentURL = htmlspecialchars($protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQ
                 
                 const elapsedSeconds = (Date.now() - startTime) / 1000;
                 const filesPerSecond = (completedFiles / elapsedSeconds).toFixed(2);
-                uploadSpeed.textContent = `⚡ ${completedFiles}/${totalFiles} files • ${filesPerSecond} files/sec`;
+                uploadSpeed.textContent = '⚡ ' + completedFiles + '/' + totalFiles + ' files • ' + filesPerSecond + ' files/sec';
             };
             
             for (let i = 0; i < totalFiles; i += MAX_PARALLEL) {
@@ -616,7 +614,7 @@ $currentURL = htmlspecialchars($protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQ
                 }));
             }
             
-            uploadSpeed.textContent = `✅ Completed ${completedFiles}/${totalFiles} files`;
+            uploadSpeed.textContent = '✅ Completed ' + completedFiles + '/' + totalFiles + ' files';
             setTimeout(() => {
                 location.reload();
             }, 1000);
@@ -675,7 +673,14 @@ $currentURL = htmlspecialchars($protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQ
             }
         }
 
-        function copyText(btn, index) {
+        // Event delegation for copy buttons
+        document.addEventListener('click', function(e) {
+            const btn = e.target.closest('.copy-btn');
+            if (!btn) return;
+            
+            const index = btn.getAttribute('data-index');
+            if (!index) return;
+            
             const textarea = document.getElementById('full-text-' + index);
             if (!textarea) return;
             
@@ -690,7 +695,7 @@ $currentURL = htmlspecialchars($protocol . $_SERVER['HTTP_HOST'] . $_SERVER['REQ
                 btn.innerHTML = '<svg fill="currentColor" viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>';
                 btn.classList.remove('copied');
             }, 2000);
-        }
+        });
     </script>
 </body>
 </html>
