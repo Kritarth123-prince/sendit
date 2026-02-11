@@ -9,10 +9,45 @@ ini_set('memory_limit', '256M');
 ini_set('max_execution_time', '600');
 ini_set('max_input_time', '600');
 
-/* ===== DOWNLOAD (stream, large files safe) ===== */
+/* ---------- small helpers ---------- */
+function h($v){return htmlspecialchars($v,ENT_QUOTES,'UTF-8');}
+
+/* sanitize a user file name: keep only basename + safe chars */
+function sanitizeFileName($name){
+    // remove any path part
+    $name = basename($name);
+    // remove control chars
+    $name = preg_replace('/[^\PC]/u','',$name);
+    // allow letters, numbers, dot, dash, underscore, space
+    $name = preg_replace('/[^A-Za-z0-9._ -]/','_',$name);
+    if ($name === '' || $name === '.' || $name === '..') $name = 'file';
+    return $name;
+}
+
+/* make a path under a base dir and be sure it stays inside */
+function safePathJoin($base,$file){
+    $base = rtrim($base,'/\\');
+    $path = $base . '/' . $file;
+    $realBase = realpath($base) ?: $base;
+    $realPath = realpath($path);
+    // if file does not exist yet (e.g. for fopen "wb"), realpath() is false
+    if ($realPath === false) {
+        $realPath = $path;
+    }
+    // normalize
+    $realBase = str_replace('\\','/',$realBase);
+    $realPath = str_replace('\\','/',$realPath);
+    if (strpos($realPath,$realBase.'/') !== 0 && $realPath !== $realBase){
+        throw new RuntimeException('Invalid path');
+    }
+    return $realPath;
+}
+
+/* ---------- DOWNLOAD (stream, large files safe, basic content-type) ---------- */
 if (isset($_GET['download'])) {
-    $file = basename($_GET['download']);
-    $filePath = __DIR__ . '/uploads/' . $file;
+    $file = sanitizeFileName($_GET['download']);
+    $uploadDir = __DIR__ . '/uploads';
+    $filePath = safePathJoin($uploadDir, $file);
 
     if (!is_file($filePath)) {
         http_response_code(404);
@@ -23,8 +58,14 @@ if (isset($_GET['download'])) {
 
     $size = filesize($filePath);
 
+    // very small content type detection
+    $finfo = function_exists('finfo_open') ? finfo_open(FILEINFO_MIME_TYPE) : false;
+    $mime  = $finfo ? @finfo_file($finfo,$filePath) : 'application/octet-stream';
+    if ($finfo) finfo_close($finfo);
+    if (!$mime) $mime = 'application/octet-stream';
+
     header('Content-Description: File Transfer');
-    header('Content-Type: application/octet-stream');
+    header('Content-Type: '.$mime);
     header('Content-Disposition: attachment; filename="' . rawurlencode($file) . '"');
     header('Content-Transfer-Encoding: binary');
     header('Content-Length: ' . $size);
@@ -43,7 +84,6 @@ if (isset($_GET['download'])) {
     while (!feof($fp)) {
         $buffer = fread($fp, $chunkSize);
         echo $buffer;
-
         if (function_exists('fastcgi_finish_request')) {
             fastcgi_finish_request();
         } else {
@@ -56,8 +96,8 @@ if (isset($_GET['download'])) {
     exit;
 }
 
-/* ===== LOGIN / LOGOUT ===== */
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
+/* ---------- LOGIN / LOGOUT ---------- */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password']) && !isset($_POST['chunk'])) {
     if ($_POST['password'] === $correctPassword) {
         $_SESSION['logged_in'] = true;
         if (isset($_POST['remember'])) {
@@ -121,11 +161,11 @@ if (!$isLoggedIn) {
     exit;
 }
 
-/* ===== SETUP ===== */
-$uploadDir = 'uploads/';
-$chunksDir = 'uploads/chunks/';
-$textFile  = 'uploads/texts.json';
-$metaFile  = 'uploads/metadata.json';
+/* ---------- SETUP DIRS / FILES ---------- */
+$uploadDir = __DIR__ . '/uploads';
+$chunksDir = __DIR__ . '/uploads/chunks';
+$textFile  = $uploadDir . '/texts.json';
+$metaFile  = $uploadDir . '/metadata.json';
 
 if (!is_dir($uploadDir))  mkdir($uploadDir, 0777, true);
 if (!is_dir($chunksDir))  mkdir($chunksDir, 0777, true);
@@ -133,20 +173,22 @@ if (!is_dir($chunksDir))  mkdir($chunksDir, 0777, true);
 $metadata = file_exists($metaFile) ? json_decode(file_get_contents($metaFile), true) : [];
 if (!is_array($metadata)) $metadata = [];
 
-/* ===== DELETE FILE ===== */
+/* ---------- DELETE FILE ---------- */
 if (isset($_GET['delete_file'])) {
-    $fileToDelete = basename($_GET['delete_file']);
-    $filePath = $uploadDir . $fileToDelete;
-    if (file_exists($filePath) && is_file($filePath)) {
-        unlink($filePath);
-        unset($metadata[$fileToDelete]);
-        file_put_contents($metaFile, json_encode($metadata));
-    }
+    $fileToDelete = sanitizeFileName($_GET['delete_file']);
+    try {
+        $filePath = safePathJoin($uploadDir, $fileToDelete);
+        if (file_exists($filePath) && is_file($filePath)) {
+            unlink($filePath);
+            unset($metadata[$fileToDelete]);
+            file_put_contents($metaFile, json_encode($metadata));
+        }
+    } catch (Throwable $e) { /* ignore invalid path */ }
     header('Location: ' . $_SERVER['PHP_SELF']);
     exit;
 }
 
-/* ===== DELETE TEXT ===== */
+/* ---------- DELETE TEXT ---------- */
 if (isset($_GET['delete_text'])) {
     $textIndex = (int)$_GET['delete_text'];
     $texts = file_exists($textFile) ? json_decode(file_get_contents($textFile), true) : [];
@@ -158,48 +200,92 @@ if (isset($_GET['delete_text'])) {
     exit;
 }
 
-/* ===== CHUNKED UPLOAD HANDLER ===== */
+/* ---------- CHUNKED UPLOAD HANDLER (secured paths) ---------- */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk']) && !isset($_POST['text'])) {
     header('Content-Type: application/json');
 
     $chunk       = (int)$_POST['chunk'];
     $totalChunks = (int)$_POST['totalChunks'];
-    $fileName    = $_POST['fileName'];
-    $uploadId    = $_POST['uploadId'];
+    $fileNameRaw = isset($_POST['fileName']) ? $_POST['fileName'] : 'file';
+    $fileName    = sanitizeFileName($fileNameRaw);
 
-    $chunkFile = $chunksDir . $uploadId . '_' . $chunk;
+    // uploadId used only as token part; allow limited chars
+    $uploadIdRaw = isset($_POST['uploadId']) ? $_POST['uploadId'] : '';
+    $uploadId    = preg_replace('/[^A-Za-z0-9_-]/','',$uploadIdRaw);
+    if ($uploadId === '') $uploadId = bin2hex(random_bytes(8));
+
+    $chunkBaseName = $uploadId . '_' . $chunk;
+    try {
+        $chunkFile = safePathJoin($chunksDir, $chunkBaseName);
+    } catch (Throwable $e) {
+        echo json_encode(['success'=>false,'error'=>'Invalid path']);
+        exit;
+    }
 
     if (isset($_FILES['file']) && $_FILES['file']['error'] === UPLOAD_ERR_OK) {
-        move_uploaded_file($_FILES['file']['tmp_name'], $chunkFile);
+        if (!move_uploaded_file($_FILES['file']['tmp_name'], $chunkFile)) {
+            echo json_encode(['success'=>false,'error'=>'Move failed']);
+            exit;
+        }
 
         $allChunksUploaded = true;
         for ($i = 0; $i < $totalChunks; $i++) {
-            if (!file_exists($chunksDir . $uploadId . '_' . $i)) {
+            $chkName = $uploadId . '_' . $i;
+            try {
+                $chkPath = safePathJoin($chunksDir, $chkName);
+            } catch (Throwable $e) { $allChunksUploaded = false; break; }
+            if (!file_exists($chkPath)) {
                 $allChunksUploaded = false;
                 break;
             }
         }
 
         if ($allChunksUploaded) {
-            $finalFile = $uploadDir . $fileName;
+            // build final file name safely
+            $info = pathinfo($fileName);
+            $base = isset($info['filename']) ? $info['filename'] : 'file';
+            $ext  = isset($info['extension']) ? '.' . $info['extension'] : '';
+            $safeBase = preg_replace('/[^A-Za-z0-9._-]/','_',$base);
+            if ($safeBase === '') $safeBase = 'file';
+            $fileName = $safeBase . $ext;
 
+            try {
+                $finalFile = safePathJoin($uploadDir, $fileName);
+            } catch (Throwable $e) {
+                echo json_encode(['success'=>false,'error'=>'Invalid final path']);
+                exit;
+            }
+
+            // if exists, add suffix
             if (file_exists($finalFile)) {
-                $info = pathinfo($fileName);
-                $base = $info['filename'];
-                $ext  = isset($info['extension']) ? '.' . $info['extension'] : '';
                 $c = 1;
-                while (file_exists($uploadDir . $base . '_' . $c . $ext)) $c++;
-                $fileName = $base . '_' . $c . $ext;
-                $finalFile = $uploadDir . $fileName;
+                do {
+                    $altName = $safeBase . '_' . $c . $ext;
+                    $finalFile = safePathJoin($uploadDir, $altName);
+                    $c++;
+                } while (file_exists($finalFile));
+                $fileName = basename($finalFile);
             }
 
             $out = fopen($finalFile, 'wb');
+            if ($out === false) {
+                echo json_encode(['success'=>false,'error'=>'Cannot open final file']);
+                exit;
+            }
+
             for ($i = 0; $i < $totalChunks; $i++) {
-                $chunkPath = $chunksDir . $uploadId . '_' . $i;
+                $chkName = $uploadId . '_' . $i;
+                try {
+                    $chunkPath = safePathJoin($chunksDir, $chkName);
+                } catch (Throwable $e) { continue; }
+                if (!is_file($chunkPath)) continue;
                 $in = fopen($chunkPath, 'rb');
-                stream_copy_to_stream($in, $out);
-                fclose($in);
-                unlink($chunkPath);
+                if ($in) {
+                    stream_copy_to_stream($in, $out);
+                    fclose($in);
+                }
+                // safe unlink
+                @unlink($chunkPath);
             }
             fclose($out);
 
@@ -216,24 +302,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk']) && !isset($_
     exit;
 }
 
-/* ===== TEXT LOAD / SAVE ===== */
+/* ---------- TEXT LOAD / SAVE ---------- */
 $texts = file_exists($textFile) ? json_decode(file_get_contents($textFile), true) : [];
 if (!is_array($texts)) $texts = [];
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['text'])) {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['text']) && !isset($_POST['chunk'])) {
     $texts[] = ['time' => time(), 'content' => $_POST['text']];
     file_put_contents($textFile, json_encode($texts));
-    $message = "✅ Text saved!";
+    $message = "��� Text saved!";
 }
 
-/* ===== AUTO DELETE OLD FILES / TEXTS ===== */
+/* ---------- AUTO DELETE ---------- */
 $oldTime = time() - (72 * 60 * 60);
 $metadataChanged = false;
 
 $allFilesInDir = array_diff(scandir($uploadDir), ['.', '..', 'texts.json', 'chunks', 'metadata.json']);
 
 foreach ($allFilesInDir as $file) {
-    $filePath = $uploadDir . $file;
+    $filePath = $uploadDir . '/' . $file;
     if (is_file($filePath) && !isset($metadata[$file])) {
         $metadata[$file] = filemtime($filePath);
         $metadataChanged = true;
@@ -241,8 +327,8 @@ foreach ($allFilesInDir as $file) {
 }
 
 foreach ($metadata as $fileName => $uploadTime) {
+    $filePath = $uploadDir . '/' . $fileName;
     if ($uploadTime < $oldTime) {
-        $filePath = $uploadDir . $fileName;
         if (file_exists($filePath)) @unlink($filePath);
         unset($metadata[$fileName]);
         $metadataChanged = true;
@@ -250,7 +336,8 @@ foreach ($metadata as $fileName => $uploadTime) {
 }
 
 foreach ($metadata as $fileName => $uploadTime) {
-    if (!file_exists($uploadDir . $fileName)) {
+    $filePath = $uploadDir . '/' . $fileName;
+    if (!file_exists($filePath)) {
         unset($metadata[$fileName]);
         $metadataChanged = true;
     }
@@ -264,10 +351,9 @@ if ($metadataChanged) {
 $chunkFiles = @scandir($chunksDir);
 if ($chunkFiles) {
     foreach ($chunkFiles as $chunk) {
-        if ($chunk !== '.' && $chunk !== '..') {
-            $chunkPath = $chunksDir . $chunk;
-            if (@filemtime($chunkPath) < time() - 3600) @unlink($chunkPath);
-        }
+        if ($chunk === '.' || $chunk === '..') continue;
+        $chunkPath = $chunksDir . '/' . $chunk;
+        if (@filemtime($chunkPath) < time() - 3600) @unlink($chunkPath);
     }
 }
 
@@ -280,7 +366,7 @@ if (count($texts) !== count($oldTexts)) {
     file_put_contents($textFile, json_encode(array_values($texts)));
 }
 
-/* ===== HELPERS ===== */
+/* ---------- HELPERS FOR VIEW ---------- */
 function getDateCategory($ts) {
     $today = strtotime('today');
     $yesterday = strtotime('yesterday');
@@ -288,7 +374,6 @@ function getDateCategory($ts) {
     if ($ts >= $yesterday)return 'Yesterday';
     return date('d M Y', $ts);
 }
-
 function formatFileSize($bytes) {
     if ($bytes >= 1073741824) return number_format($bytes / 1073741824, 2) . ' GB';
     if ($bytes >= 1048576)   return number_format($bytes / 1048576, 2) . ' MB';
@@ -296,12 +381,12 @@ function formatFileSize($bytes) {
     return $bytes . ' bytes';
 }
 
-/* ===== GROUP FILES / TEXTS BY DATE ===== */
+/* ---------- GROUP FILES / TEXTS ---------- */
 $filesByDate = [];
 $allFiles = array_diff(scandir($uploadDir), ['.', '..', 'texts.json', 'chunks', 'metadata.json']);
 
 foreach ($allFiles as $file) {
-    $filePath = $uploadDir . $file;
+    $filePath = $uploadDir . '/' . $file;
     if (is_file($filePath)) {
         $uploadTime = isset($metadata[$file]) ? $metadata[$file] : filemtime($filePath);
         $cat = getDateCategory($uploadTime);
@@ -377,7 +462,7 @@ $totalTexts = count($texts);
         .delete-btn:hover{background:#c82333;transform:scale(1.1)}
         .delete-btn svg{width:16px;height:16px}
         .texts-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:15px}
-        .text-item{background:#fff9e6;padding:15px 15px 15px 15px;padding-top:45px;border-radius:10px;position:relative;border-left:4px solid #ffc107;min-height:100px;box-shadow:0 2px 6px rgba(0,0,0,.1);transition:transform .2s}
+        .text-item{background:#fff9e6;padding:15px;padding-top:45px;border-radius:10px;position:relative;border-left:4px solid #ffc107;min-height:100px;box-shadow:0 2px 6px rgba(0,0,0,.1);transition:transform .2s}
         .text-item:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.15)}
         .text-content{color:#333;word-break:break-word;font-size:14px;line-height:1.5}
         .copy-btn{position:absolute;top:8px;right:48px;background:#667eea;color:#fff;border:none;padding:8px;border-radius:6px;cursor:pointer;width:32px;height:32px;display:flex;align-items:center;justify-content:center}
@@ -392,13 +477,10 @@ $totalTexts = count($texts);
         .progress-bar{width:100%;height:25px;background:#e9ecef;border-radius:8px;overflow:hidden;position:relative}
         .progress-fill{height:100%;background:linear-gradient(90deg,#667eea,#764ba2);transition:width .3s;display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:bold}
         .upload-speed{text-align:center;color:#667eea;font-size:12px;margin-top:5px}
-
-        /* drag & drop zone */
         #fileInput{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
         .drop-zone{margin-top:10px;padding:20px;border:2px dashed #667eea;border-radius:10px;text-align:center;color:#555;background:#f8f9ff;cursor:pointer;transition:background .2s,border-color .2s}
         .drop-zone.dragover{background:#e0e4ff;border-color:#5568d3}
         .drop-zone small{display:block;color:#777;margin-top:4px}
-
         @media(max-width:768px){
             .files{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
             .file-preview{height:120px}
@@ -410,11 +492,11 @@ $totalTexts = count($texts);
 <div class="container">
     <h1>⚡ Fast Media Transfer</h1>
     <div class="logout"><a href="?logout">🔓 Logout</a></div>
-    <div class="ip">📡 Share: <strong><?= htmlspecialchars($currentURL,ENT_QUOTES) ?></strong></div>
+    <div class="ip">📡 Share: <strong><?= h($currentURL) ?></strong></div>
     <div class="info">🗑️ Auto-delete after 72 hours • 📦 Max 200MB • ⚡ 3 parallel uploads</div>
 
     <?php if (isset($message)): ?>
-        <div class="message"><?= $message ?></div>
+        <div class="message"><?= h($message) ?></div>
     <?php endif; ?>
 
     <div class="section">
@@ -424,7 +506,6 @@ $totalTexts = count($texts);
                 Drag &amp; drop files here
                 <small>or click to select</small>
             </div>
-
             <input type="file" id="fileInput" name="files[]" multiple required>
             <div class="file-count" id="fileCount"></div>
             <button type="submit" id="uploadBtn">Upload Files</button>
@@ -450,27 +531,27 @@ $totalTexts = count($texts);
             <h2>📋 Saved Texts (<?= $totalTexts ?>)</h2>
             <?php foreach ($textsByDate as $dateCategory => $dateTexts): ?>
                 <div class="date-group">
-                    <div class="date-header"><?= htmlspecialchars($dateCategory) ?> (<?= count($dateTexts) ?>)</div>
+                    <div class="date-header"><?= h($dateCategory) ?> (<?= count($dateTexts) ?>)</div>
                     <div class="texts-grid">
                         <?php foreach ($dateTexts as $textData): ?>
                             <div class="text-item">
-                                <button class="copy-btn" onclick="copyText(this, <?= $textData['index'] ?>)">
+                                <button class="copy-btn" onclick="copyText(this, <?= (int)$textData['index'] ?>)">
                                     <svg fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
                                     </svg>
                                 </button>
-                                <a href="?delete_text=<?= $textData['index'] ?>" class="delete-btn" onclick="return confirm('Delete this text?')">
+                                <a href="?delete_text=<?= (int)$textData['index'] ?>" class="delete-btn" onclick="return confirm('Delete this text?')">
                                     <svg fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
                                     </svg>
                                 </a>
                                 <div class="text-content">
                                     <?php
-                                    $content = htmlspecialchars($textData['content']);
+                                    $content = h($textData['content']);
                                     echo strlen($content) > 150 ? substr($content, 0, 150) . '...' : $content;
                                     ?>
                                 </div>
-                                <textarea id="full-text-<?= $textData['index'] ?>" style="display:none;"><?= htmlspecialchars($textData['content']) ?></textarea>
+                                <textarea id="full-text-<?= (int)$textData['index'] ?>" style="display:none;"><?= h($textData['content']) ?></textarea>
                             </div>
                         <?php endforeach; ?>
                     </div>
@@ -484,7 +565,7 @@ $totalTexts = count($texts);
             <h2>📥 Files (<?= $totalFiles ?>)</h2>
             <?php foreach ($filesByDate as $dateCategory => $dateFiles): ?>
                 <div class="date-group">
-                    <div class="date-header"><?= htmlspecialchars($dateCategory) ?> (<?= count($dateFiles) ?>)</div>
+                    <div class="date-header"><?= h($dateCategory) ?> (<?= count($dateFiles) ?>)</div>
                     <div class="files">
                         <?php foreach ($dateFiles as $fileData):
                             $file = $fileData['name'];
@@ -492,27 +573,26 @@ $totalTexts = count($texts);
                             $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
                             $fileSize = formatFileSize(filesize($filePath));
                             $fileType = strtoupper($ext);
-
                             $imageExts = ['jpg','jpeg','png','gif','webp','bmp'];
                             $videoExts = ['mp4','webm','ogg','mov','avi'];
                             $pdfExts   = ['pdf'];
                             $audioExts = ['mp3','wav','ogg','aac'];
                             ?>
                             <div class="file-card">
-                                <a href="?delete_file=<?= urlencode($file) ?>" class="delete-btn" onclick="return confirm('Delete <?= htmlspecialchars($file) ?>?')">
+                                <a href="?delete_file=<?= urlencode($file) ?>" class="delete-btn" onclick="return confirm('Delete <?= h($file) ?>?')">
                                     <svg fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
                                     </svg>
                                 </a>
                                 <div class="file-preview">
                                     <?php if (in_array($ext, $imageExts)): ?>
-                                        <img src="<?= htmlspecialchars($filePath) ?>" alt="<?= htmlspecialchars($file) ?>">
+                                        <img src="<?= h('uploads/'.$file) ?>" alt="<?= h($file) ?>">
                                     <?php elseif (in_array($ext, $videoExts)): ?>
                                         <video controls>
-                                            <source src="<?= htmlspecialchars($filePath) ?>" type="video/<?= $ext ?>">
+                                            <source src="<?= h('uploads/'.$file) ?>" type="video/<?= h($ext) ?>">
                                         </video>
                                     <?php elseif (in_array($ext, $pdfExts)): ?>
-                                        <iframe src="<?= htmlspecialchars($filePath) ?>#toolbar=0"></iframe>
+                                        <iframe src="<?= h('uploads/'.$file) ?>#toolbar=0"></iframe>
                                     <?php elseif (in_array($ext, $audioExts)): ?>
                                         <div class="file-icon">🎵</div>
                                     <?php elseif ($ext === 'doc' || $ext === 'docx'): ?>
@@ -524,8 +604,8 @@ $totalTexts = count($texts);
                                     <?php endif; ?>
                                 </div>
                                 <div class="file-info">
-                                    <div class="file-name" title="<?= htmlspecialchars($file) ?>"><?= htmlspecialchars($file) ?></div>
-                                    <div class="file-meta"><?= $fileType ?> • <?= $fileSize ?></div>
+                                    <div class="file-name" title="<?= h($file) ?>"><?= h($file) ?></div>
+                                    <div class="file-meta"><?= h($fileType) ?> • <?= h($fileSize) ?></div>
                                     <a href="?download=<?= urlencode($file) ?>" class="download-btn">Download</a>
                                 </div>
                             </div>
@@ -551,7 +631,6 @@ fileInput.addEventListener('change', e => {
     fileCount.textContent = c ? `📁 ${c} file(s) selected` : '';
 });
 
-// drag + drop
 ['dragenter','dragover','dragleave','drop'].forEach(ev=>{
     dropZone.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation();});
 });
@@ -569,7 +648,6 @@ dropZone.addEventListener('drop',e=>{
     fileCount.textContent=`📁 ${files.length} file(s) selected`;
 });
 
-// upload
 document.getElementById('uploadForm').addEventListener('submit',async e=>{
     e.preventDefault();
     const files = Array.from(fileInput.files);
