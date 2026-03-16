@@ -2,22 +2,19 @@
 session_start();
 
 /* ================== CONFIG ================== */
-$correctPassword = 'Text'; // change this
-
-ini_set('upload_max_filesize', '200M');
-ini_set('post_max_size', '210M');
+$correctPasswords = ['admin'];
+ini_set('upload_max_filesize', '80M');
+ini_set('post_max_size', '900M');
 ini_set('memory_limit', '256M');
 ini_set('max_execution_time', '600');
 ini_set('max_input_time', '600');
 
-/* ---------- safe self url for redirects ---------- */
+/* ---------- helpers ---------- */
 $selfPath = '/' . ltrim(basename(parse_url($_SERVER['SCRIPT_NAME'] ?? '', PHP_URL_PATH)), '/');
 if ($selfPath === '/' || $selfPath === '') $selfPath = '/index.php';
 $selfUrl = $selfPath;
 
-/* ---------- helpers ---------- */
 function h($v){return htmlspecialchars($v,ENT_QUOTES,'UTF-8');}
-
 function sanitizeFileName($name){
     $name = basename($name);
     $name = preg_replace('/[^\PC]/u','',$name);
@@ -25,7 +22,6 @@ function sanitizeFileName($name){
     if ($name === '' || $name === '.' || $name === '..') $name = 'file';
     return $name;
 }
-
 function safePathJoin($base,$file){
     $base = rtrim($base,'/\\');
     $path = $base . '/' . $file;
@@ -40,33 +36,147 @@ function safePathJoin($base,$file){
     return $realPath;
 }
 
-/* ---------- simple remember cookie token (no md5) ---------- */
-function getRememberToken(){
-    return bin2hex(random_bytes(32)); // 64 hex chars
-}
-
+function getRememberToken(){return bin2hex(random_bytes(32));}
 function getRememberCookieParams(): array {
-    $secure   = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
-    $httponly = true;
+    $secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
     return [
         'expires'  => time() + (30 * 24 * 60 * 60),
         'path'     => '/',
         'secure'   => $secure,
-        'httponly' => $httponly,
+        'httponly' => true,
         'samesite' => 'Lax',
     ];
 }
-
 function getRememberCookieClearParams(): array {
-    $secure   = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
-    $httponly = true;
+    $secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
     return [
         'expires'  => time() - 3600,
         'path'     => '/',
         'secure'   => $secure,
-        'httponly' => $httponly,
+        'httponly' => true,
         'samesite' => 'Lax',
     ];
+}
+
+/* ================== DOWNLOAD ZIP BY DATE ================== */
+if (isset($_GET['download_zip'])) {
+    set_time_limit(0);
+    ini_set('memory_limit', '512M');
+    
+    $dateCategory = $_GET['download_zip'];
+    $uploadDir = __DIR__ . '/uploads';
+    $metaFile  = $uploadDir . '/metadata.json';
+    $metadata = file_exists($metaFile) ? json_decode(file_get_contents($metaFile), true) : [];
+    
+    $zipName = 'files_' . preg_replace('/[^A-Za-z0-9_-]/', '_', $dateCategory) . '.zip';
+    
+    $filesToZip = [];
+    $allFiles = array_diff(scandir($uploadDir), ['.', '..', 'texts.json', 'chunks', 'metadata.json']);
+    
+    foreach ($allFiles as $file) {
+        $filePath = $uploadDir . '/' . $file;
+        if (is_file($filePath)) {
+            $uploadTime = isset($metadata[$file]) ? $metadata[$file] : filemtime($filePath);
+            $cat = getDateCategory($uploadTime);
+            
+            if ($cat === $dateCategory) {
+                $filesToZip[] = ['path' => $filePath, 'name' => $file];
+            }
+        }
+    }
+    
+    if (empty($filesToZip)) {
+        exit('No files found for this date');
+    }
+    
+    while (ob_get_level()) {
+        ob_end_clean();
+    }
+    
+    $tempZip = sys_get_temp_dir() . '/' . uniqid('zip_', true) . '.zip';
+    
+    $zip = new ZipArchive();
+    if ($zip->open($tempZip, ZipArchive::CREATE | ZipArchive::OVERWRITE) === TRUE) {
+        foreach ($filesToZip as $fileData) {
+            $zip->addFile($fileData['path'], $fileData['name']);
+        }
+        $zip->close();
+        
+        if (file_exists($tempZip)) {
+            $fileSize = filesize($tempZip);
+            
+            header('Content-Type: application/zip');
+            header('Content-Disposition: attachment; filename="' . $zipName . '"');
+            header('Content-Length: ' . $fileSize);
+            header('Cache-Control: no-cache, must-revalidate');
+            header('Pragma: public');
+            header('Content-Transfer-Encoding: binary');
+            
+            $handle = fopen($tempZip, 'rb');
+            if ($handle) {
+                while (!feof($handle)) {
+                    $buffer = fread($handle, 1024 * 1024);
+                    echo $buffer;
+                    flush();
+                    
+                    if (connection_status() != CONNECTION_NORMAL) {
+                        break;
+                    }
+                }
+                fclose($handle);
+            }
+            
+            @unlink($tempZip);
+            exit;
+        }
+    }
+    
+    exit('Failed to create ZIP');
+}
+
+/* ================== DELETE FILES BY DAY ================== */
+if (isset($_GET['delete_day'])) {
+    $dateCategory = $_GET['delete_day'];
+    $uploadDir = __DIR__ . '/uploads';
+    $metaFile  = $uploadDir . '/metadata.json';
+    $metadata = file_exists($metaFile) ? json_decode(file_get_contents($metaFile), true) : [];
+    
+    $allFiles = array_diff(scandir($uploadDir), ['.', '..', 'texts.json', 'chunks', 'metadata.json']);
+    
+    foreach ($allFiles as $file) {
+        $filePath = $uploadDir . '/' . $file;
+        if (is_file($filePath)) {
+            $uploadTime = isset($metadata[$file]) ? $metadata[$file] : filemtime($filePath);
+            $cat = getDateCategory($uploadTime);
+            
+            if ($cat === $dateCategory) {
+                @unlink($filePath);
+                unset($metadata[$file]);
+            }
+        }
+    }
+    
+    file_put_contents($metaFile, json_encode($metadata, JSON_UNESCAPED_SLASHES));
+    header('Location: ' . $selfUrl);
+    exit;
+}
+
+/* ================== DELETE TEXTS BY DAY ================== */
+if (isset($_GET['delete_texts_day'])) {
+    $dateCategory = $_GET['delete_texts_day'];
+    $uploadDir = __DIR__ . '/uploads';
+    $textFile  = $uploadDir . '/texts.json';
+    
+    $texts = file_exists($textFile) ? json_decode(file_get_contents($textFile), true) : [];
+    if (!is_array($texts)) $texts = [];
+    
+    $filtered = array_filter($texts, function($item) use ($dateCategory) {
+        return getDateCategory($item['time']) !== $dateCategory;
+    });
+    
+    file_put_contents($textFile, json_encode(array_values($filtered), JSON_UNESCAPED_SLASHES));
+    header('Location: ' . $selfUrl);
+    exit;
 }
 
 /* ================== DOWNLOAD ================== */
@@ -83,7 +193,6 @@ if (isset($_GET['download'])) {
     while (ob_get_level()) ob_end_clean();
 
     $size = filesize($filePath);
-
     $finfo = function_exists('finfo_open') ? finfo_open(FILEINFO_MIME_TYPE) : false;
     $mime  = $finfo ? @finfo_file($finfo,$filePath) : 'application/octet-stream';
     if ($finfo) finfo_close($finfo);
@@ -121,25 +230,20 @@ if (isset($_GET['download'])) {
     exit;
 }
 
-/* ================== AUTH (login / logout / remember) ================== */
-
-/* load remember token store */
-$remFile   = __DIR__ . '/remember_tokens.json';
-$remember  = file_exists($remFile) ? json_decode(file_get_contents($remFile), true) : [];
+/* ================== AUTH ================== */
+$remFile = __DIR__ . '/remember_tokens.json';
+$remember = file_exists($remFile) ? json_decode(file_get_contents($remFile), true) : [];
 if (!is_array($remember)) $remember = [];
 
-/* login */
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password']) && !isset($_POST['chunk']) && !isset($_POST['text'])) {
-    if (hash_equals($correctPassword, $_POST['password'])) { // constant-time compare
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password']) && !isset($_POST['chunk']) && !isset($_POST['text']) && !isset($_POST['edit_text'])) {
+    if (in_array($_POST['password'], $correctPasswords, true)) {
         $_SESSION['logged_in'] = true;
 
         if (isset($_POST['remember'])) {
             $token = getRememberToken();
             $remember[$token] = ['created' => time()];
             file_put_contents($remFile, json_encode($remember, JSON_UNESCAPED_SLASHES));
-
-            $params = getRememberCookieParams();
-            setcookie('transfer_auth', $token, $params);
+            setcookie('transfer_auth', $token, getRememberCookieParams());
         }
         header('Location: ' . $selfUrl);
         exit;
@@ -148,7 +252,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password']) && !isset
     }
 }
 
-/* logout */
 if (isset($_GET['logout'])) {
     session_destroy();
 
@@ -158,15 +261,13 @@ if (isset($_GET['logout'])) {
             unset($remember[$t]);
             file_put_contents($remFile, json_encode($remember, JSON_UNESCAPED_SLASHES));
         }
-        $params = getRememberCookieClearParams();
-        setcookie('transfer_auth', '', $params);
+        setcookie('transfer_auth', '', getRememberCookieClearParams());
     }
 
     header('Location: ' . $selfUrl);
     exit;
 }
 
-/* check auth */
 $isLoggedIn = isset($_SESSION['logged_in']);
 
 if (!$isLoggedIn && isset($_COOKIE['transfer_auth'])) {
@@ -218,14 +319,14 @@ if (!$isLoggedIn) {
     exit;
 }
 
-/* ================== SETUP FILES / DIRS ================== */
+/* ================== SETUP ================== */
 $uploadDir = __DIR__ . '/uploads';
 $chunksDir = __DIR__ . '/uploads/chunks';
 $textFile  = $uploadDir . '/texts.json';
 $metaFile  = $uploadDir . '/metadata.json';
 
-if (!is_dir($uploadDir))  mkdir($uploadDir, 0777, true);
-if (!is_dir($chunksDir))  mkdir($chunksDir, 0777, true);
+if (!is_dir($uploadDir)) mkdir($uploadDir, 0777, true);
+if (!is_dir($chunksDir)) mkdir($chunksDir, 0777, true);
 
 $metadata = file_exists($metaFile) ? json_decode(file_get_contents($metaFile), true) : [];
 if (!is_array($metadata)) $metadata = [];
@@ -257,17 +358,37 @@ if (isset($_GET['delete_text'])) {
     exit;
 }
 
-/* ================== CHUNKED UPLOAD HANDLER ================== */
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk']) && !isset($_POST['text'])) {
+/* ================== EDIT TEXT ================== */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['edit_text']) && isset($_POST['text_index'])) {
+    $texts = file_exists($textFile) ? json_decode(file_get_contents($textFile), true) : [];
+    $index = (int)$_POST['text_index'];
+    
+    if (isset($texts[$index])) {
+        $oldTime = time() - (72 * 60 * 60);
+        
+        if ($texts[$index]['time'] >= $oldTime) {
+            $texts[$index]['content'] = $_POST['edit_text'];
+            file_put_contents($textFile, json_encode($texts, JSON_UNESCAPED_SLASHES));
+            $message = "✅ Text updated!";
+        } else {
+            $message = "⚠️ Cannot edit - 72 hours expired!";
+        }
+    }
+    header('Location: ' . $selfUrl);
+    exit;
+}
+
+/* ================== CHUNKED UPLOAD ================== */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk']) && !isset($_POST['text']) && !isset($_POST['edit_text'])) {
     header('Content-Type: application/json');
 
-    $chunk       = (int)$_POST['chunk'];
+    $chunk = (int)$_POST['chunk'];
     $totalChunks = (int)$_POST['totalChunks'];
     $fileNameRaw = $_POST['fileName'] ?? 'file';
-    $fileName    = sanitizeFileName($fileNameRaw);
+    $fileName = sanitizeFileName($fileNameRaw);
 
     $uploadIdRaw = $_POST['uploadId'] ?? '';
-    $uploadId    = preg_replace('/[^A-Za-z0-9_-]/','',$uploadIdRaw);
+    $uploadId = preg_replace('/[^A-Za-z0-9_-]/','',$uploadIdRaw);
     if ($uploadId === '') $uploadId = bin2hex(random_bytes(8));
 
     $chunkBaseName = $uploadId . '_' . $chunk;
@@ -299,7 +420,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk']) && !isset($_
         if ($allChunksUploaded) {
             $info = pathinfo($fileName);
             $base = $info['filename'] ?? 'file';
-            $ext  = isset($info['extension']) ? '.' . $info['extension'] : '';
+            $ext = isset($info['extension']) ? '.' . $info['extension'] : '';
             $safeBase = preg_replace('/[^A-Za-z0-9._-]/','_',$base);
             if ($safeBase === '') $safeBase = 'file';
             $fileName = $safeBase . $ext;
@@ -359,10 +480,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk']) && !isset($_
 $texts = file_exists($textFile) ? json_decode(file_get_contents($textFile), true) : [];
 if (!is_array($texts)) $texts = [];
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['text']) && !isset($_POST['chunk'])) {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['text']) && !isset($_POST['chunk']) && !isset($_POST['edit_text'])) {
     $texts[] = ['time' => time(), 'content' => $_POST['text']];
     file_put_contents($textFile, json_encode($texts, JSON_UNESCAPED_SLASHES));
-    $message = "✅ Text saved!";
+    header('Location: ' . $selfUrl);
+    exit;
 }
 
 /* ================== AUTO DELETE ================== */
@@ -400,7 +522,6 @@ if ($metadataChanged) {
     file_put_contents($metaFile, json_encode($metadata, JSON_UNESCAPED_SLASHES));
 }
 
-/* clean old chunks (1 hour) */
 $chunkFiles = @scandir($chunksDir);
 if ($chunkFiles) {
     foreach ($chunkFiles as $chunk) {
@@ -410,7 +531,6 @@ if ($chunkFiles) {
     }
 }
 
-/* auto-delete texts */
 $oldTexts = $texts;
 $texts = array_filter($texts, function($item) use ($oldTime) {
     return isset($item['time']) && $item['time'] >= $oldTime;
@@ -423,18 +543,17 @@ if (count($texts) !== count($oldTexts)) {
 function getDateCategory($ts) {
     $today = strtotime('today');
     $yesterday = strtotime('yesterday');
-    if ($ts >= $today)    return 'Today';
-    if ($ts >= $yesterday)return 'Yesterday';
+    if ($ts >= $today) return 'Today';
+    if ($ts >= $yesterday) return 'Yesterday';
     return date('d M Y', $ts);
 }
 function formatFileSize($bytes) {
     if ($bytes >= 1073741824) return number_format($bytes / 1073741824, 2) . ' GB';
-    if ($bytes >= 1048576)   return number_format($bytes / 1048576, 2) . ' MB';
-    if ($bytes >= 1024)      return number_format($bytes / 1024, 2) . ' KB';
+    if ($bytes >= 1048576) return number_format($bytes / 1048576, 2) . ' MB';
+    if ($bytes >= 1024) return number_format($bytes / 1024, 2) . ' KB';
     return $bytes . ' bytes';
 }
 
-/* group files / texts */
 $filesByDate = [];
 $allFiles = array_diff(scandir($uploadDir), ['.', '..', 'texts.json', 'chunks', 'metadata.json']);
 
@@ -471,7 +590,7 @@ uksort($textsByDate, function($a, $b) {
     return strtotime($b) - strtotime($a);
 });
 
-$protocol   = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? "https://" : "http://";
+$protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? "https://" : "http://";
 $currentURL = $protocol . $_SERVER['HTTP_HOST'] . $selfUrl;
 
 $totalFiles = count($allFiles);
@@ -491,8 +610,16 @@ $totalTexts = count($texts);
         .section{margin-bottom:25px}
         .section h2{font-size:18px;margin-bottom:10px;color:#333}
         .date-group{margin-bottom:20px}
-        .date-header{font-size:16px;font-weight:bold;color:#667eea;margin-bottom:12px;padding-bottom:8px;border-bottom:2px solid #667eea;display:flex;align-items:center;gap:8px}
-        .date-header::before{content:'📅'}
+        .date-header{font-size:16px;font-weight:bold;color:#667eea;margin-bottom:12px;padding-bottom:8px;border-bottom:2px solid #667eea;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+        .date-label{display:flex;align-items:center;gap:8px}
+        .date-label::before{content:'📅'}
+        .btn-group{display:flex;gap:8px;flex-wrap:wrap}
+        .btn-group a{color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;text-decoration:none;display:inline-block;font-weight:bold}
+        .zip-btn{background:#28a745}
+        .zip-btn:hover{background:#218838}
+        .del-btn{background:#dc3545;padding:8px 12px}
+        .del-btn:hover{background:#c82333}
+        .del-btn svg{width:16px;height:16px;vertical-align:middle}
         textarea{width:100%;padding:12px;border:2px solid #667eea;border-radius:8px;font-size:14px;height:80px;resize:none}
         button{width:100%;padding:12px;background:#667eea;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-top:10px;font-weight:bold}
         button:hover{background:#5568d3}
@@ -517,9 +644,12 @@ $totalTexts = count($texts);
         .text-item{background:#fff9e6;padding:15px;padding-top:45px;border-radius:10px;position:relative;border-left:4px solid #ffc107;min-height:100px;box-shadow:0 2px 6px rgba(0,0,0,.1);transition:transform .2s}
         .text-item:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.15)}
         .text-content{color:#333;word-break:break-word;font-size:14px;line-height:1.5}
-        .copy-btn{position:absolute;top:8px;right:48px;background:#667eea;color:#fff;border:none;padding:8px;border-radius:6px;cursor:pointer;width:32px;height:32px;display:flex;align-items:center;justify-content:center}
+        .copy-btn,.edit-btn{position:absolute;top:8px;background:#667eea;color:#fff;border:none;padding:8px;border-radius:6px;cursor:pointer;width:32px;height:32px;display:flex;align-items:center;justify-content:center}
+        .copy-btn{right:48px}
+        .edit-btn{right:88px;background:#ff9800}
+        .edit-btn:hover{background:#e68900}
         .copy-btn:hover{background:#5568d3}
-        .copy-btn svg{width:16px;height:16px}
+        .copy-btn svg,.edit-btn svg{width:16px;height:16px}
         .copied{background:#28a745!important}
         .info{text-align:center;color:#666;font-size:12px;margin-bottom:15px}
         .logout{text-align:center;margin-bottom:15px}
@@ -533,10 +663,19 @@ $totalTexts = count($texts);
         .drop-zone{margin-top:10px;padding:20px;border:2px dashed #667eea;border-radius:10px;text-align:center;color:#555;background:#f8f9ff;cursor:pointer;transition:background .2s,border-color .2s}
         .drop-zone.dragover{background:#e0e4ff;border-color:#5568d3}
         .drop-zone small{display:block;color:#777;margin-top:4px}
+        .modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center}
+        .modal.show{display:flex}
+        .modal-content{background:#fff;padding:30px;border-radius:15px;max-width:500px;width:90%}
+        .modal-content textarea{height:150px}
+        .modal-buttons{display:flex;gap:10px;margin-top:15px}
+        .modal-buttons button{margin:0}
         @media(max-width:768px){
             .files{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
             .file-preview{height:120px}
             .texts-grid{grid-template-columns:1fr}
+            .date-header{flex-direction:column;align-items:flex-start}
+            .btn-group{width:100%}
+            .btn-group a{flex:1;text-align:center}
         }
     </style>
 </head>
@@ -546,10 +685,6 @@ $totalTexts = count($texts);
     <div class="logout"><a href="?logout">🔓 Logout</a></div>
     <div class="ip">📡 Share: <strong><?= h($currentURL) ?></strong></div>
     <div class="info">🗑️ Auto-delete after 72 hours • 📦 Max 200MB • ⚡ 3 parallel uploads</div>
-
-    <?php if (isset($message)): ?>
-        <div class="message"><?= h($message) ?></div>
-    <?php endif; ?>
 
     <div class="section">
         <h2>📤 Upload Files</h2>
@@ -572,8 +707,8 @@ $totalTexts = count($texts);
 
     <div class="section">
         <h2>📝 Save Text or URL</h2>
-        <form method="POST">
-            <textarea name="text" placeholder="Paste text or URL..." required></textarea>
+        <form id="textForm" method="POST">
+            <textarea name="text" id="textArea" placeholder="Paste text or URL..." required></textarea>
             <button type="submit">Save Text</button>
         </form>
     </div>
@@ -583,10 +718,26 @@ $totalTexts = count($texts);
             <h2>📋 Saved Texts (<?= $totalTexts ?>)</h2>
             <?php foreach ($textsByDate as $dateCategory => $dateTexts): ?>
                 <div class="date-group">
-                    <div class="date-header"><?= h($dateCategory) ?> (<?= count($dateTexts) ?>)</div>
+                    <div class="date-header">
+                        <div class="date-label"><?= h($dateCategory) ?> (<?= count($dateTexts) ?>)</div>
+                        <a href="?delete_texts_day=<?= urlencode($dateCategory) ?>" class="del-btn" onclick="return confirm('Delete all texts from <?= h($dateCategory) ?>?')">
+                            <svg fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+                            </svg>
+                        </a>
+                    </div>
                     <div class="texts-grid">
-                        <?php foreach ($dateTexts as $textData): ?>
+                        <?php foreach ($dateTexts as $textData): 
+                            $canEdit = ($textData['time'] >= (time() - 72 * 60 * 60));
+                        ?>
                             <div class="text-item">
+                                <?php if ($canEdit): ?>
+                                <button class="edit-btn" onclick="openEditModal(<?= (int)$textData['index'] ?>)">
+                                    <svg fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
+                                    </svg>
+                                </button>
+                                <?php endif; ?>
                                 <button class="copy-btn" onclick="copyText(this, <?= (int)$textData['index'] ?>)">
                                     <svg fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
@@ -617,7 +768,13 @@ $totalTexts = count($texts);
             <h2>📥 Files (<?= $totalFiles ?>)</h2>
             <?php foreach ($filesByDate as $dateCategory => $dateFiles): ?>
                 <div class="date-group">
-                    <div class="date-header"><?= h($dateCategory) ?> (<?= count($dateFiles) ?>)</div>
+                    <div class="date-header">
+                        <div class="date-label"><?= h($dateCategory) ?> (<?= count($dateFiles) ?>)</div>
+                        <div class="btn-group">
+                            <a href="?download_zip=<?= urlencode($dateCategory) ?>" class="zip-btn">📦 Download ZIP</a>
+                            <a href="?delete_day=<?= urlencode($dateCategory) ?>" class="del-btn" onclick="return confirm('Delete all files from <?= h($dateCategory) ?>?')">🗑️ Delete Day</a>
+                        </div>
+                    </div>
                     <div class="files">
                         <?php foreach ($dateFiles as $fileData):
                             $file = $fileData['name'];
@@ -627,7 +784,7 @@ $totalTexts = count($texts);
                             $fileType = strtoupper($ext);
                             $imageExts = ['jpg','jpeg','png','gif','webp','bmp'];
                             $videoExts = ['mp4','webm','ogg','mov','avi'];
-                            $pdfExts   = ['pdf'];
+                            $pdfExts = ['pdf'];
                             $audioExts = ['mp3','wav','ogg','aac'];
                             ?>
                             <div class="file-card">
@@ -669,14 +826,31 @@ $totalTexts = count($texts);
     <?php endif; ?>
 </div>
 
+<!-- Edit Modal -->
+<div class="modal" id="editModal">
+    <div class="modal-content">
+        <h2>✏️ Edit Text</h2>
+        <form method="POST" id="editForm">
+            <textarea name="edit_text" id="editTextArea" required></textarea>
+            <input type="hidden" name="text_index" id="editTextIndex">
+            <div class="modal-buttons">
+                <button type="submit" style="background:#28a745">Save Changes</button>
+                <button type="button" onclick="closeEditModal()" style="background:#dc3545">Cancel</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <script>
-const CHUNK_SIZE   = 15 * 1024 * 1024;
-const MAX_FILE_SIZE= 200 * 1024 * 1024;
+const CHUNK_SIZE = 15 * 1024 * 1024;
+const MAX_FILE_SIZE = 200 * 1024 * 1024;
 const MAX_PARALLEL = 3;
 
-const fileInput  = document.getElementById('fileInput');
-const fileCount  = document.getElementById('fileCount');
-const dropZone   = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const fileCount = document.getElementById('fileCount');
+const dropZone = document.getElementById('dropZone');
+const textForm = document.getElementById('textForm');
+const textArea = document.getElementById('textArea');
 
 fileInput.addEventListener('change', e => {
     const c = e.target.files.length;
@@ -760,6 +934,12 @@ document.getElementById('uploadForm').addEventListener('submit',async e=>{
     setTimeout(()=>location.reload(),1000);
 });
 
+textForm.addEventListener('submit',e=>{
+    e.preventDefault();
+    if(!textArea.value.trim())return;
+    textForm.submit();
+});
+
 async function uploadChunked(file,onProgress){
     const totalChunks=Math.ceil(file.size/CHUNK_SIZE);
     const uploadId=Date.now()+'_'+Math.random().toString(36).substr(2,9);
@@ -793,6 +973,17 @@ function copyText(btn,index){
         btn.innerHTML='<svg fill="currentColor" viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>';
         btn.classList.remove('copied');
     },2000);
+}
+
+function openEditModal(index){
+    const textarea=document.getElementById('full-text-'+index);
+    document.getElementById('editTextArea').value=textarea.value;
+    document.getElementById('editTextIndex').value=index;
+    document.getElementById('editModal').classList.add('show');
+}
+
+function closeEditModal(){
+    document.getElementById('editModal').classList.remove('show');
 }
 </script>
 </body>
