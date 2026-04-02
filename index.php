@@ -35,7 +35,6 @@ function safePathJoin($base,$file){
     }
     return $realPath;
 }
-/* These helpers are used early (ZIP/delete handlers) so must be defined here */
 function getDateCategory($ts) {
     $today = strtotime('today'); $yesterday = strtotime('yesterday');
     if ($ts >= $today) return 'Today';
@@ -51,9 +50,15 @@ function formatFileSize($bytes) {
 function isUrl($str) { return (bool)filter_var(trim($str), FILTER_VALIDATE_URL); }
 function getMeta($metadata, $file) {
     $m = $metadata[$file] ?? null;
-    if ($m === null) return ['time'=>0,'permanent'=>false];
-    if (is_int($m) || is_float($m)) return ['time'=>(int)$m,'permanent'=>false];
-    return ['time'=>(int)($m['time']??0),'permanent'=>(bool)($m['permanent']??false)];
+    if ($m === null) return ['time'=>0,'permanent'=>false,'fav'=>false,'folder'=>'','downloads'=>0];
+    if (is_int($m) || is_float($m)) return ['time'=>(int)$m,'permanent'=>false,'fav'=>false,'folder'=>'','downloads'=>0];
+    return [
+        'time'=>(int)($m['time']??0),
+        'permanent'=>(bool)($m['permanent']??false),
+        'fav'=>(bool)($m['fav']??false),
+        'folder'=>(string)($m['folder']??''),
+        'downloads'=>(int)($m['downloads']??0),
+    ];
 }
 function getTextFilePreview($filePath, $lines=5) {
     $h = @fopen($filePath,'r'); if (!$h) return '';
@@ -61,7 +66,6 @@ function getTextFilePreview($filePath, $lines=5) {
     while (($l=fgets($h))!==false && $i<$lines) { $out.=$l; $i++; }
     fclose($h); return $out;
 }
-
 function getRememberToken(){return bin2hex(random_bytes(32));}
 function getRememberCookieParams(): array {
     $secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
@@ -71,208 +75,136 @@ function getRememberCookieClearParams(): array {
     $secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
     return ['expires'=>time()-3600,'path'=>'/','secure'=>$secure,'httponly'=>true,'samesite'=>'Lax'];
 }
+/* Generate a share token */
+function generateShareToken(){ return bin2hex(random_bytes(16)); }
 
-/* ================== [NEW] URL METADATA FETCH (SSRF-safe) ================== */
+/* ================== URL METADATA FETCH (SSRF-safe) ================== */
 if (isset($_GET['fetch_meta']) && !empty($_GET['url'])) {
     header('Content-Type: application/json');
     $rawUrl = trim($_GET['url']);
-
-    // Validate URL format
-    if (!filter_var($rawUrl, FILTER_VALIDATE_URL)) {
-        echo json_encode(['error' => 'Invalid URL']); exit;
-    }
+    if (!filter_var($rawUrl, FILTER_VALIDATE_URL)) { echo json_encode(['error'=>'Invalid URL']); exit; }
     $parsed = parse_url($rawUrl);
-
-    // SSRF protection: only http/https, block private/reserved IPs and hosts
-    if (!isset($parsed['scheme']) || !in_array(strtolower($parsed['scheme']), ['http','https'])) {
-        echo json_encode(['error' => 'Only HTTP/HTTPS allowed']); exit;
-    }
+    if (!isset($parsed['scheme']) || !in_array(strtolower($parsed['scheme']),['http','https'])) { echo json_encode(['error'=>'Only HTTP/HTTPS allowed']); exit; }
     $host = $parsed['host'] ?? '';
-    $blockedPatterns = [
-        '/^localhost$/i', '/^127\./', '/^10\./', '/^172\.(1[6-9]|2[0-9]|3[01])\./',
-        '/^192\.168\./', '/^169\.254\./', '/^::1$/', '/^fc00:/', '/^fe80:/',
-        '/^0\.0\.0\.0$/', '/metadata\.google\.internal/i', '/^169\.254\.169\.254$/',
-    ];
-    foreach ($blockedPatterns as $pat) {
-        if (preg_match($pat, $host)) { echo json_encode(['error'=>'Blocked host']); exit; }
-    }
-    // Also resolve hostname and block private IPs
+    $blockedPatterns = ['/^localhost$/i','/^127\./','/^10\./','/^172\.(1[6-9]|2[0-9]|3[01])\./','/^192\.168\./','/^169\.254\./','/^::1$/','/ ^fc00:/','/ ^fe80:/','/ ^0\.0\.0\.0$/','/ metadata\.google\.internal/i','/^169\.254\.169\.254$/'];
+    foreach ($blockedPatterns as $pat) { if (preg_match($pat, $host)) { echo json_encode(['error'=>'Blocked host']); exit; } }
     $resolvedIp = @gethostbyname($host);
-    $privateRanges = ['127.','10.','192.168.','169.254.','fc00:','fe80:','::1'];
-    foreach ($privateRanges as $range) {
-        if (strpos($resolvedIp, $range) === 0) { echo json_encode(['error'=>'Blocked resolved IP']); exit; }
-    }
-
-    // Realistic browser User-Agent — many sites (Instagram, Meesho, etc.) block bots
+    foreach (['127.','10.','192.168.','169.254.','fc00:','fe80:','::1'] as $r) { if (strpos($resolvedIp,$r)===0) { echo json_encode(['error'=>'Blocked resolved IP']); exit; } }
     $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-
-    // ---- oEmbed shortcut for known platforms ----
-    // These platforms protect their pages but expose oEmbed endpoints
-    $oembedEndpoints = [
-        'instagram.com'  => 'https://graph.facebook.com/v18.0/instagram_oembed?url=',
-        'www.instagram.com' => 'https://graph.facebook.com/v18.0/instagram_oembed?url=',
-        'youtube.com'    => 'https://www.youtube.com/oembed?format=json&url=',
-        'www.youtube.com'=> 'https://www.youtube.com/oembed?format=json&url=',
-        'youtu.be'       => 'https://www.youtube.com/oembed?format=json&url=',
-        'twitter.com'    => 'https://publish.twitter.com/oembed?url=',
-        'x.com'          => 'https://publish.twitter.com/oembed?url=',
-        'vimeo.com'      => 'https://vimeo.com/api/oembed.json?url=',
-        'www.vimeo.com'  => 'https://vimeo.com/api/oembed.json?url=',
-    ];
-
+    $oembedEndpoints = ['instagram.com'=>'https://graph.facebook.com/v18.0/instagram_oembed?url=','www.instagram.com'=>'https://graph.facebook.com/v18.0/instagram_oembed?url=','youtube.com'=>'https://www.youtube.com/oembed?format=json&url=','www.youtube.com'=>'https://www.youtube.com/oembed?format=json&url=','youtu.be'=>'https://www.youtube.com/oembed?format=json&url=','twitter.com'=>'https://publish.twitter.com/oembed?url=','x.com'=>'https://publish.twitter.com/oembed?url=','vimeo.com'=>'https://vimeo.com/api/oembed.json?url=','www.vimeo.com'=>'https://vimeo.com/api/oembed.json?url='];
     $meta = ['url'=>$rawUrl,'title'=>'','description'=>'','image'=>'','favicon'=>'','domain'=>$host];
-
-    // Try oEmbed first for supported platforms
     $oembedUrl = null;
-    foreach ($oembedEndpoints as $oeDomain => $endpoint) {
-        if (strcasecmp($host, $oeDomain) === 0) {
-            $oembedUrl = $endpoint . urlencode($rawUrl);
-            break;
-        }
-    }
-
+    foreach ($oembedEndpoints as $oeDomain => $endpoint) { if (strcasecmp($host,$oeDomain)===0) { $oembedUrl=$endpoint.urlencode($rawUrl); break; } }
     if ($oembedUrl) {
-        $ch2 = curl_init();
-        curl_setopt_array($ch2, [
-            CURLOPT_URL            => $oembedUrl,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT        => 6,
-            CURLOPT_CONNECTTIMEOUT => 4,
-            CURLOPT_USERAGENT      => $ua,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => 0,
-        ]);
-        $oembedBody = curl_exec($ch2);
-        $oembedCode = curl_getinfo($ch2, CURLINFO_HTTP_CODE);
-        curl_close($ch2);
-
-        if ($oembedBody && $oembedCode === 200) {
-            $oe = @json_decode($oembedBody, true);
-            if ($oe) {
-                $meta['title']       = mb_substr($oe['title'] ?? '', 0, 200);
-                $meta['description'] = mb_substr($oe['author_name'] ?? '', 0, 200);
-                $meta['image']       = $oe['thumbnail_url'] ?? '';
-                $meta['favicon']     = $parsed['scheme'].'://'.$host.'/favicon.ico';
-                $meta['domain']      = $host;
-                echo json_encode($meta); exit;
-            }
-        }
+        $ch2=curl_init(); curl_setopt_array($ch2,[CURLOPT_URL=>$oembedUrl,CURLOPT_RETURNTRANSFER=>true,CURLOPT_TIMEOUT=>6,CURLOPT_CONNECTTIMEOUT=>4,CURLOPT_USERAGENT=>$ua,CURLOPT_SSL_VERIFYPEER=>false,CURLOPT_SSL_VERIFYHOST=>0]);
+        $oembedBody=curl_exec($ch2); $oembedCode=curl_getinfo($ch2,CURLINFO_HTTP_CODE); curl_close($ch2);
+        if ($oembedBody && $oembedCode===200) { $oe=@json_decode($oembedBody,true); if($oe){$meta['title']=mb_substr($oe['title']??'',0,200);$meta['description']=mb_substr($oe['author_name']??'',0,200);$meta['image']=$oe['thumbnail_url']??'';$meta['favicon']=$parsed['scheme'].'://'.$host.'/favicon.ico';$meta['domain']=$host;echo json_encode($meta);exit;} }
     }
-
-    // ---- Fall back to HTML scrape ----
-    $ch = curl_init();
-    curl_setopt_array($ch, [
-        CURLOPT_URL            => $rawUrl,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS      => 5,
-        CURLOPT_TIMEOUT        => 10,
-        CURLOPT_CONNECTTIMEOUT => 5,
-        CURLOPT_USERAGENT      => $ua,
-        CURLOPT_HTTPHEADER     => [
-            'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language: en-US,en;q=0.9',
-            'Accept-Encoding: identity',
-            'Cache-Control: no-cache',
-            'Pragma: no-cache',
-        ],
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_SSL_VERIFYHOST => 0,
-        CURLOPT_ENCODING       => 'identity',
-    ]);
-    $html      = curl_exec($ch);
-    $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $finalUrl  = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
-    curl_close($ch);
-
-    // Re-parse host from final (redirected) URL for favicon etc.
-    $finalParsed = parse_url($finalUrl ?: $rawUrl);
-    $finalHost   = $finalParsed['host'] ?? $host;
-    $finalScheme = $finalParsed['scheme'] ?? $parsed['scheme'];
-    $meta['domain'] = $finalHost;
-
-    // If blocked (4xx/5xx) or no body, return minimal domain card
-    if (!$html || strlen(trim($html)) < 100 || $httpCode >= 400) {
-        $meta['favicon'] = $finalScheme.'://'.$finalHost.'/favicon.ico';
-        echo json_encode($meta); exit;
-    }
-
-    // Parse only the <head> section for speed
-    $headEnd = stripos($html, '</head>');
-    $head = $headEnd !== false ? substr($html, 0, $headEnd + 7) : substr($html, 0, 15000);
-
-    // Flexible meta extractor — handles both attribute orders
-    $getMeta = function($patterns) use ($head) {
-        foreach ((array)$patterns as $pattern) {
-            if (preg_match($pattern, $head, $m)) {
-                $val = html_entity_decode(trim($m[1]), ENT_QUOTES, 'UTF-8');
-                if ($val !== '') return $val;
-            }
-        }
-        return '';
-    };
-
-    $meta['title'] = $getMeta([
-        '/<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\']/i',
-        '/<meta[^>]+content=["\'](.*?)["\']\s+property=["\']og:title["\']/i',
-        '/<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\'](.*?)["\']/i',
-        '/<meta[^>]+content=["\'](.*?)["\']\s+name=["\']twitter:title["\']/i',
-        '/<title[^>]*>\s*(.*?)\s*<\/title>/si',
-    ]);
-
-    $meta['description'] = $getMeta([
-        '/<meta[^>]+property=["\']og:description["\'][^>]+content=["\'](.*?)["\']/i',
-        '/<meta[^>]+content=["\'](.*?)["\']\s+property=["\']og:description["\']/i',
-        '/<meta[^>]+name=["\']twitter:description["\'][^>]+content=["\'](.*?)["\']/i',
-        '/<meta[^>]+content=["\'](.*?)["\']\s+name=["\']twitter:description["\']/i',
-        '/<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']/i',
-        '/<meta[^>]+content=["\'](.*?)["\']\s+name=["\']description["\']/i',
-    ]);
-
-    $meta['image'] = $getMeta([
-        '/<meta[^>]+property=["\']og:image["\'][^>]+content=["\'](.*?)["\']/i',
-        '/<meta[^>]+content=["\'](.*?)["\']\s+property=["\']og:image["\']/i',
-        '/<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\'](.*?)["\']/i',
-        '/<meta[^>]+content=["\'](.*?)["\']\s+name=["\']twitter:image["\']/i',
-        '/<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\'](.*?)["\']/i',
-    ]);
-
-    if ($meta['image'] && !filter_var($meta['image'], FILTER_VALIDATE_URL)) {
-        $meta['image'] = $finalScheme.'://'.$finalHost.'/'.ltrim($meta['image'],'/');
-    }
-    if ($meta['image'] && !preg_match('/^https?:\/\//i', $meta['image'])) {
-        $meta['image'] = '';
-    }
-
-    $fav = $getMeta([
-        '/<link[^>]+rel=["\']shortcut icon["\'][^>]+href=["\'](.*?)["\']/i',
-        '/<link[^>]+href=["\'](.*?)["\']\s+rel=["\']shortcut icon["\']/i',
-        '/<link[^>]+rel=["\']icon["\'][^>]+href=["\'](.*?)["\']/i',
-        '/<link[^>]+href=["\'](.*?)["\']\s+rel=["\']icon["\']/i',
-    ]);
-    if (!$fav) {
-        $fav = $finalScheme.'://'.$finalHost.'/favicon.ico';
-    } elseif (!filter_var($fav, FILTER_VALIDATE_URL)) {
-        if (strpos($fav,'//') === 0) $fav = $finalScheme.':'.$fav;
-        else $fav = $finalScheme.'://'.$finalHost.'/'.ltrim($fav,'/');
-    }
-    $meta['favicon'] = $fav;
-
-    $meta['title']       = mb_substr($meta['title'], 0, 200);
-    $meta['description'] = mb_substr($meta['description'], 0, 500);
+    $ch=curl_init(); curl_setopt_array($ch,[CURLOPT_URL=>$rawUrl,CURLOPT_RETURNTRANSFER=>true,CURLOPT_FOLLOWLOCATION=>true,CURLOPT_MAXREDIRS=>5,CURLOPT_TIMEOUT=>10,CURLOPT_CONNECTTIMEOUT=>5,CURLOPT_USERAGENT=>$ua,CURLOPT_HTTPHEADER=>['Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8','Accept-Language: en-US,en;q=0.9','Accept-Encoding: identity','Cache-Control: no-cache','Pragma: no-cache'],CURLOPT_SSL_VERIFYPEER=>false,CURLOPT_SSL_VERIFYHOST=>0,CURLOPT_ENCODING=>'identity']);
+    $html=curl_exec($ch); $httpCode=curl_getinfo($ch,CURLINFO_HTTP_CODE); $finalUrl=curl_getinfo($ch,CURLINFO_EFFECTIVE_URL); curl_close($ch);
+    $finalParsed=parse_url($finalUrl?:$rawUrl); $finalHost=$finalParsed['host']??$host; $finalScheme=$finalParsed['scheme']??$parsed['scheme']; $meta['domain']=$finalHost;
+    if (!$html||strlen(trim($html))<100||$httpCode>=400) { $meta['favicon']=$finalScheme.'://'.$finalHost.'/favicon.ico'; echo json_encode($meta); exit; }
+    $headEnd=stripos($html,'</head>'); $head=$headEnd!==false?substr($html,0,$headEnd+7):substr($html,0,15000);
+    $getM=function($patterns) use ($head){foreach((array)$patterns as $p){if(preg_match($p,$head,$m)){$v=html_entity_decode(trim($m[1]),ENT_QUOTES,'UTF-8');if($v!=='')return $v;}}return '';};
+    $meta['title']=$getM(['/<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\']/i','/<meta[^>]+content=["\'](.*?)["\']\s+property=["\']og:title["\']/i','/<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\'](.*?)["\']/i','/<title[^>]*>\s*(.*?)\s*<\/title>/si']);
+    $meta['description']=$getM(['/<meta[^>]+property=["\']og:description["\'][^>]+content=["\'](.*?)["\']/i','/<meta[^>]+content=["\'](.*?)["\']\s+property=["\']og:description["\']/i','/<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']/i']);
+    $meta['image']=$getM(['/<meta[^>]+property=["\']og:image["\'][^>]+content=["\'](.*?)["\']/i','/<meta[^>]+content=["\'](.*?)["\']\s+property=["\']og:image["\']/i','/<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\'](.*?)["\']/i']);
+    if($meta['image']&&!filter_var($meta['image'],FILTER_VALIDATE_URL))$meta['image']=$finalScheme.'://'.$finalHost.'/'.ltrim($meta['image'],'/');
+    if($meta['image']&&!preg_match('/^https?:\/\//i',$meta['image']))$meta['image']='';
+    $fav=$getM(['/<link[^>]+rel=["\']shortcut icon["\'][^>]+href=["\'](.*?)["\']/i','/<link[^>]+rel=["\']icon["\'][^>]+href=["\'](.*?)["\']/i']);
+    if(!$fav)$fav=$finalScheme.'://'.$finalHost.'/favicon.ico';elseif(!filter_var($fav,FILTER_VALIDATE_URL)){if(strpos($fav,'//')===0)$fav=$finalScheme.':'.$fav;else $fav=$finalScheme.'://'.$finalHost.'/'.ltrim($fav,'/');}
+    $meta['favicon']=$fav; $meta['title']=mb_substr($meta['title'],0,200); $meta['description']=mb_substr($meta['description'],0,500);
     echo json_encode($meta); exit;
+}
+
+/* ================== SHAREABLE LINKS ================== */
+$uploadDir = __DIR__ . '/uploads';
+$shareFile = $uploadDir . '/shares.json';
+
+// Handle share link access (public, no auth needed)
+if (isset($_GET['share'])) {
+    $token = preg_replace('/[^A-Za-z0-9]/','',$_GET['share']);
+    $shares = file_exists($shareFile) ? json_decode(file_get_contents($shareFile),true) : [];
+    if (!is_array($shares)) $shares = [];
+    $share = $shares[$token] ?? null;
+    $shareError = null;
+    if (!$share) { $shareError = 'This share link is invalid or has expired.'; }
+    else {
+        // Check expiry
+        if ($share['expires'] !== 0 && time() > $share['expires']) { $shareError = 'This share link has expired.'; }
+        // Check download limit
+        elseif ($share['max_downloads'] > 0 && ($share['downloads'] ?? 0) >= $share['max_downloads']) { $shareError = 'Download limit reached for this link.'; }
+    }
+    // Password check
+    $sharePasswordOk = empty($share['password']);
+    if (!$sharePasswordOk && isset($_POST['share_password'])) {
+        $sharePasswordOk = password_verify($_POST['share_password'], $share['password']);
+        if (!$sharePasswordOk) $sharePasswordError = true;
+    }
+
+    if (!$shareError && !$sharePasswordOk) {
+        // Show password form
+        ?><!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Protected Link — Fast Transfer</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0d0d18;color:#e8e6f4;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.box{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:32px;max-width:400px;width:100%;text-align:center}h2{font-size:20px;margin-bottom:8px}p{color:#a9a7bb;font-size:14px;margin-bottom:24px}input{width:100%;padding:12px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#e8e6f4;font-size:15px;margin-bottom:12px;outline:none}.err{color:#f87171;font-size:13px;margin-bottom:12px}button{width:100%;padding:13px;background:linear-gradient(135deg,#7c6aff,#a78bfa);color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer}</style>
+</head><body><div class="box"><div style="font-size:48px;margin-bottom:16px">🔒</div>
+<h2>Password Protected</h2><p>This file requires a password to access.</p>
+<?php if(isset($sharePasswordError)):?><div class="err">❌ Incorrect password</div><?php endif;?>
+<form method="POST"><input type="password" name="share_password" placeholder="Enter password" autofocus required><button type="submit">Unlock →</button></form>
+</div></body></html><?php exit;
+    }
+
+    if (!$shareError && $sharePasswordOk) {
+        $file = $share['file'];
+        $filePath = $uploadDir.'/'.$file;
+        if (!is_file($filePath)) { $shareError = 'The file no longer exists.'; }
+        else {
+            // Track download
+            $shares[$token]['downloads'] = ($shares[$token]['downloads'] ?? 0) + 1;
+            file_put_contents($shareFile, json_encode($shares, JSON_UNESCAPED_SLASHES));
+            // Stream file
+            while (ob_get_level()) ob_end_clean();
+            $size = filesize($filePath);
+            $finfo = function_exists('finfo_open') ? finfo_open(FILEINFO_MIME_TYPE) : false;
+            $mime  = $finfo ? @finfo_file($finfo,$filePath) : 'application/octet-stream';
+            if ($finfo) finfo_close($finfo);
+            if (!$mime) $mime = 'application/octet-stream';
+            header('Content-Description: File Transfer');
+            header('Content-Type: '.$mime);
+            header('Content-Disposition: attachment; filename="'.rawurlencode($file).'"');
+            header('Content-Transfer-Encoding: binary');
+            header('Content-Length: '.$size);
+            header('Cache-Control: no-cache, must-revalidate');
+            $fp = fopen($filePath,'rb');
+            if ($fp) { while(!feof($fp)){echo fread($fp,262144);flush();} fclose($fp); }
+            exit;
+        }
+    }
+    ?><!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Share Link — Fast Transfer</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0d0d18;color:#e8e6f4;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.box{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:32px;max-width:420px;width:100%;text-align:center}h2{font-size:20px;margin-bottom:8px}p{color:#a9a7bb;font-size:14px}</style>
+</head><body><div class="box"><div style="font-size:56px;margin-bottom:16px">❌</div>
+<h2>Link Unavailable</h2><p><?= h($shareError ?? 'Unknown error') ?></p>
+</div></body></html><?php exit;
+}
+
+/* ================== CREATE SHARE LINK (AJAX) ================== */
+if (isset($_GET['create_share']) && !empty($_GET['file'])) {
+    // Auth check happens after auth block — we skip here and re-check below
+    // (will be validated below after auth)
 }
 
 /* ================== DOWNLOAD ZIP BY DATE ================== */
 if (isset($_GET['download_zip'])) {
     set_time_limit(0); ini_set('memory_limit','512M');
     $dateCategory = $_GET['download_zip'];
-    $uploadDir = __DIR__ . '/uploads';
     $metaFile  = $uploadDir . '/metadata.json';
     $metadata = file_exists($metaFile) ? json_decode(file_get_contents($metaFile), true) : [];
     $zipName = 'files_' . preg_replace('/[^A-Za-z0-9_-]/','_',$dateCategory) . '.zip';
     $filesToZip = [];
-    $allFiles = array_diff(scandir($uploadDir), ['.','..','texts.json','chunks','metadata.json']);
+    $allFiles = array_diff(scandir($uploadDir), ['.','..','texts.json','chunks','metadata.json','shares.json','folders.json']);
     foreach ($allFiles as $file) {
         $filePath = $uploadDir.'/'.$file;
         if (is_file($filePath)) {
@@ -289,10 +221,8 @@ if (isset($_GET['download_zip'])) {
         foreach ($filesToZip as $fd) $zip->addFile($fd['path'],$fd['name']);
         $zip->close();
         if (file_exists($tempZip)) {
-            header('Content-Type: application/zip');
-            header('Content-Disposition: attachment; filename="'.$zipName.'"');
-            header('Content-Length: '.filesize($tempZip));
-            header('Cache-Control: no-cache, must-revalidate');
+            header('Content-Type: application/zip'); header('Content-Disposition: attachment; filename="'.$zipName.'"');
+            header('Content-Length: '.filesize($tempZip)); header('Cache-Control: no-cache, must-revalidate');
             $handle = fopen($tempZip,'rb');
             if ($handle) { while(!feof($handle)){echo fread($handle,1048576);flush();} fclose($handle); }
             @unlink($tempZip); exit;
@@ -304,10 +234,9 @@ if (isset($_GET['download_zip'])) {
 /* ================== DELETE FILES BY DAY ================== */
 if (isset($_GET['delete_day'])) {
     $dateCategory = $_GET['delete_day'];
-    $uploadDir = __DIR__ . '/uploads';
-    $metaFile  = $uploadDir . '/metadata.json';
+    $metaFile = $uploadDir . '/metadata.json';
     $metadata = file_exists($metaFile) ? json_decode(file_get_contents($metaFile), true) : [];
-    $allFiles = array_diff(scandir($uploadDir), ['.','..','texts.json','chunks','metadata.json']);
+    $allFiles = array_diff(scandir($uploadDir), ['.','..','texts.json','chunks','metadata.json','shares.json','folders.json']);
     foreach ($allFiles as $file) {
         $filePath = $uploadDir.'/'.$file;
         if (is_file($filePath)) {
@@ -323,13 +252,10 @@ if (isset($_GET['delete_day'])) {
 /* ================== DELETE TEXTS BY DAY ================== */
 if (isset($_GET['delete_texts_day'])) {
     $dateCategory = $_GET['delete_texts_day'];
-    $uploadDir = __DIR__ . '/uploads';
     $textFile  = $uploadDir . '/texts.json';
     $texts = file_exists($textFile) ? json_decode(file_get_contents($textFile), true) : [];
     if (!is_array($texts)) $texts = [];
-    $filtered = array_filter($texts, function($item) use ($dateCategory) {
-        return getDateCategory($item['time']) !== $dateCategory;
-    });
+    $filtered = array_filter($texts, function($item) use ($dateCategory) { return getDateCategory($item['time']) !== $dateCategory; });
     file_put_contents($textFile, json_encode(array_values($filtered), JSON_UNESCAPED_SLASHES));
     header('Location: '.$selfUrl); exit;
 }
@@ -337,9 +263,16 @@ if (isset($_GET['delete_texts_day'])) {
 /* ================== DOWNLOAD ================== */
 if (isset($_GET['download'])) {
     $file = sanitizeFileName($_GET['download']);
-    $uploadDir = __DIR__ . '/uploads';
     $filePath = safePathJoin($uploadDir, $file);
     if (!is_file($filePath)) { http_response_code(404); exit('File not found'); }
+    // Track downloads
+    $metaFile = $uploadDir . '/metadata.json';
+    $metadata = file_exists($metaFile) ? json_decode(file_get_contents($metaFile), true) : [];
+    if (!is_array($metadata)) $metadata = [];
+    if (isset($metadata[$file]) && is_array($metadata[$file])) {
+        $metadata[$file]['downloads'] = ($metadata[$file]['downloads'] ?? 0) + 1;
+        file_put_contents($metaFile, json_encode($metadata, JSON_UNESCAPED_SLASHES));
+    }
     while (ob_get_level()) ob_end_clean();
     $size = filesize($filePath);
     $finfo = function_exists('finfo_open') ? finfo_open(FILEINFO_MIME_TYPE) : false;
@@ -427,17 +360,7 @@ if (!$isLoggedIn) {
         button[type=submit]{width:100%;padding:14px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;border-radius:11px;font-size:15px;font-weight:600;cursor:pointer;font-family:'DM Sans',sans-serif;transition:opacity .2s,transform .15s;box-shadow:0 4px 16px rgba(124,106,255,.35)}
         button[type=submit]:hover{opacity:.9;transform:translateY(-1px)}
         button[type=submit]:active{transform:none}
-        /* Responsive */
-        @media(max-width:480px){
-            body{padding:12px;align-items:flex-end}
-            .box{border-radius:20px 20px 0 0;padding:28px 20px 32px;max-width:100%}
-            h1{font-size:22px}
-        }
-        @media(max-width:360px){
-            .box{padding:22px 16px 28px}
-            h1{font-size:20px}
-            input[type=password]{font-size:14px;padding:12px}
-        }
+        @media(max-width:480px){body{padding:12px;align-items:flex-end}.box{border-radius:20px 20px 0 0;padding:28px 20px 32px;max-width:100%}h1{font-size:22px}}
     </style>
 </head>
 <body>
@@ -461,10 +384,10 @@ if (!$isLoggedIn) {
 <?php exit; }
 
 /* ================== SETUP ================== */
-$uploadDir = __DIR__ . '/uploads';
 $chunksDir = __DIR__ . '/uploads/chunks';
 $textFile  = $uploadDir . '/texts.json';
 $metaFile  = $uploadDir . '/metadata.json';
+$foldersFile = $uploadDir . '/folders.json';
 
 if (!is_dir($uploadDir)) mkdir($uploadDir, 0777, true);
 if (!is_dir($chunksDir)) mkdir($chunksDir, 0777, true);
@@ -472,6 +395,79 @@ if (!is_dir($chunksDir)) mkdir($chunksDir, 0777, true);
 $metadata = file_exists($metaFile) ? json_decode(file_get_contents($metaFile), true) : [];
 if (!is_array($metadata)) $metadata = [];
 
+$folders = file_exists($foldersFile) ? json_decode(file_get_contents($foldersFile), true) : [];
+if (!is_array($folders)) $folders = [];
+
+$shares = file_exists($shareFile) ? json_decode(file_get_contents($shareFile), true) : [];
+if (!is_array($shares)) $shares = [];
+
+/* ================== CREATE SHARE LINK (AJAX, post-auth) ================== */
+if (isset($_GET['create_share'])) {
+    header('Content-Type: application/json');
+    $file = sanitizeFileName($_GET['file'] ?? '');
+    $expiry = (int)($_GET['expires'] ?? 0); // 0=perm, 3600=1h, 86400=1d
+    $maxDl = (int)($_GET['max_dl'] ?? 0);
+    $rawPass = trim($_GET['password'] ?? '');
+    $hashedPass = $rawPass !== '' ? password_hash($rawPass, PASSWORD_DEFAULT) : '';
+    $token = generateShareToken();
+    $expiresAt = $expiry > 0 ? time() + $expiry : 0;
+    $shares[$token] = ['file'=>$file,'created'=>time(),'expires'=>$expiresAt,'max_downloads'=>$maxDl,'downloads'=>0,'password'=>$hashedPass];
+    file_put_contents($shareFile, json_encode($shares, JSON_UNESCAPED_SLASHES));
+    $protocol = (!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off')?"https://":"http://";
+    $shareUrl = $protocol.$_SERVER['HTTP_HOST'].dirname($selfUrl).'/?share='.$token;
+    if(dirname($selfUrl)==='/') $shareUrl = $protocol.$_SERVER['HTTP_HOST'].'/?share='.$token;
+    echo json_encode(['success'=>true,'url'=>$shareUrl,'token'=>$token]);
+    exit;
+}
+
+/* ================== REVOKE SHARE ================== */
+if (isset($_GET['revoke_share'])) {
+    $token = preg_replace('/[^A-Za-z0-9]/','',$_GET['revoke_share']);
+    unset($shares[$token]);
+    file_put_contents($shareFile, json_encode($shares, JSON_UNESCAPED_SLASHES));
+    header('Location: '.$selfUrl); exit;
+}
+
+/* ================== FOLDER ACTIONS ================== */
+if (isset($_GET['create_folder']) && !empty($_GET['name'])) {
+    $fname = trim($_GET['name']);
+    $fname = preg_replace('/[^A-Za-z0-9 _\-]/','_',$fname);
+    if ($fname !== '' && !in_array($fname,$folders)) {
+        $folders[] = $fname;
+        file_put_contents($foldersFile, json_encode($folders, JSON_UNESCAPED_SLASHES));
+    }
+    header('Location: '.$selfUrl); exit;
+}
+if (isset($_GET['delete_folder'])) {
+    $fname = $_GET['delete_folder'];
+    $folders = array_values(array_filter($folders, fn($f) => $f !== $fname));
+    file_put_contents($foldersFile, json_encode($folders, JSON_UNESCAPED_SLASHES));
+    // Remove folder from files
+    foreach ($metadata as $f => $m) {
+        if (is_array($m) && ($m['folder']??'') === $fname) { $metadata[$f]['folder'] = ''; }
+    }
+    file_put_contents($metaFile, json_encode($metadata, JSON_UNESCAPED_SLASHES));
+    header('Location: '.$selfUrl); exit;
+}
+if (isset($_GET['move_file']) && !empty($_GET['file']) && isset($_GET['folder'])) {
+    $mf = sanitizeFileName($_GET['file']);
+    $mfolder = trim($_GET['folder']);
+    if (isset($metadata[$mf]) && is_array($metadata[$mf])) {
+        $metadata[$mf]['folder'] = $mfolder;
+        file_put_contents($metaFile, json_encode($metadata, JSON_UNESCAPED_SLASHES));
+    }
+    header('Location: '.$selfUrl); exit;
+}
+
+/* ================== TOGGLE FAVORITE ================== */
+if (isset($_GET['toggle_fav'])) {
+    $tf = sanitizeFileName($_GET['toggle_fav']);
+    if (isset($metadata[$tf]) && is_array($metadata[$tf])) {
+        $metadata[$tf]['fav'] = !($metadata[$tf]['fav'] ?? false);
+        file_put_contents($metaFile, json_encode($metadata, JSON_UNESCAPED_SLASHES));
+    }
+    header('Location: '.$selfUrl); exit;
+}
 
 /* ================== DELETE FILE ================== */
 if (isset($_GET['delete_file'])) {
@@ -510,23 +506,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['edit_text']) && isset
     header('Location: '.$selfUrl); exit;
 }
 
-/* ================== [NEW] TOGGLE PERMANENT (TEXT) ================== */
+/* ================== TOGGLE PERMANENT (TEXT) ================== */
 if (isset($_GET['toggle_perm_text'])) {
     $idx = (int)$_GET['toggle_perm_text'];
     $texts = file_exists($textFile) ? json_decode(file_get_contents($textFile), true) : [];
     if (!is_array($texts)) $texts = [];
-    if (isset($texts[$idx])) {
-        $texts[$idx]['permanent'] = !((bool)($texts[$idx]['permanent'] ?? false));
-        file_put_contents($textFile, json_encode($texts, JSON_UNESCAPED_SLASHES));
-    }
+    if (isset($texts[$idx])) { $texts[$idx]['permanent'] = !((bool)($texts[$idx]['permanent'] ?? false)); file_put_contents($textFile, json_encode($texts, JSON_UNESCAPED_SLASHES)); }
     header('Location: '.$selfUrl); exit;
 }
 
-/* ================== [NEW] TOGGLE PERMANENT (FILE) ================== */
+/* ================== TOGGLE PERMANENT (FILE) ================== */
 if (isset($_GET['toggle_perm_file'])) {
     $fileToToggle = sanitizeFileName($_GET['toggle_perm_file']);
     $m = getMeta($metadata, $fileToToggle);
-    $metadata[$fileToToggle] = ['time'=>$m['time'],'permanent'=>!$m['permanent']];
+    $metadata[$fileToToggle] = array_merge(is_array($metadata[$fileToToggle]??null)?$metadata[$fileToToggle]:[], ['time'=>$m['time'],'permanent'=>!$m['permanent']]);
     file_put_contents($metaFile, json_encode($metadata, JSON_UNESCAPED_SLASHES));
     header('Location: '.$selfUrl); exit;
 }
@@ -538,7 +531,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk']) && !isset($_
     $totalChunks = (int)$_POST['totalChunks'];
     $fileNameRaw = $_POST['fileName'] ?? 'file';
     $fileName = sanitizeFileName($fileNameRaw);
-    $isPermanent = !empty($_POST['permanent']) && $_POST['permanent'] === '1'; // [NEW]
+    $isPermanent = !empty($_POST['permanent']) && $_POST['permanent'] === '1';
+    $fileFolder = trim($_POST['folder'] ?? '');
     $uploadIdRaw = $_POST['uploadId'] ?? '';
     $uploadId = preg_replace('/[^A-Za-z0-9_-]/','', $uploadIdRaw);
     if ($uploadId === '') $uploadId = bin2hex(random_bytes(8));
@@ -548,48 +542,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['chunk']) && !isset($_
     catch (Throwable $e) { echo json_encode(['success'=>false,'error'=>'Invalid path']); exit; }
 
     if (isset($_FILES['file']) && $_FILES['file']['error'] === UPLOAD_ERR_OK) {
-        if (!move_uploaded_file($_FILES['file']['tmp_name'], $chunkFile)) {
-            echo json_encode(['success'=>false,'error'=>'Move failed']); exit;
-        }
+        if (!move_uploaded_file($_FILES['file']['tmp_name'], $chunkFile)) { echo json_encode(['success'=>false,'error'=>'Move failed']); exit; }
         $allChunksUploaded = true;
         for ($i = 0; $i < $totalChunks; $i++) {
-            try { $chkPath = safePathJoin($chunksDir, $uploadId.'_'.$i); }
-            catch (Throwable $e) { $allChunksUploaded = false; break; }
+            try { $chkPath = safePathJoin($chunksDir, $uploadId.'_'.$i); } catch (Throwable $e) { $allChunksUploaded = false; break; }
             if (!file_exists($chkPath)) { $allChunksUploaded = false; break; }
         }
         if ($allChunksUploaded) {
-            $info = pathinfo($fileName);
-            $base = $info['filename'] ?? 'file';
-            $ext = isset($info['extension']) ? '.'.$info['extension'] : '';
-            $safeBase = preg_replace('/[^A-Za-z0-9._-]/','_',$base);
-            if ($safeBase === '') $safeBase = 'file';
+            $info = pathinfo($fileName); $base = $info['filename'] ?? 'file'; $ext = isset($info['extension']) ? '.'.$info['extension'] : '';
+            $safeBase = preg_replace('/[^A-Za-z0-9._-]/','_',$base); if ($safeBase === '') $safeBase = 'file';
             $fileName = $safeBase.$ext;
-            try { $finalFile = safePathJoin($uploadDir, $fileName); }
-            catch (Throwable $e) { echo json_encode(['success'=>false,'error'=>'Invalid final path']); exit; }
-            if (file_exists($finalFile)) {
-                $c=1; do { $altName=$safeBase.'_'.$c.$ext; $finalFile=safePathJoin($uploadDir,$altName); $c++; } while(file_exists($finalFile));
-                $fileName = basename($finalFile);
-            }
-            $out = fopen($finalFile,'wb');
-            if ($out === false) { echo json_encode(['success'=>false,'error'=>'Cannot open final file']); exit; }
+            try { $finalFile = safePathJoin($uploadDir, $fileName); } catch (Throwable $e) { echo json_encode(['success'=>false,'error'=>'Invalid final path']); exit; }
+            if (file_exists($finalFile)) { $c=1; do { $altName=$safeBase.'_'.$c.$ext; $finalFile=safePathJoin($uploadDir,$altName); $c++; } while(file_exists($finalFile)); $fileName = basename($finalFile); }
+            $out = fopen($finalFile,'wb'); if ($out === false) { echo json_encode(['success'=>false,'error'=>'Cannot open final file']); exit; }
             for ($i = 0; $i < $totalChunks; $i++) {
                 try { $chunkPath = safePathJoin($chunksDir, $uploadId.'_'.$i); } catch (Throwable $e) { continue; }
                 if (!is_file($chunkPath)) continue;
-                $in = fopen($chunkPath,'rb');
-                if ($in) { stream_copy_to_stream($in,$out); fclose($in); }
-                @unlink($chunkPath);
+                $in = fopen($chunkPath,'rb'); if ($in) { stream_copy_to_stream($in,$out); fclose($in); } @unlink($chunkPath);
             }
             fclose($out);
-            // [MODIFIED] Store metadata as array with permanent flag
-            $metadata[$fileName] = ['time'=>time(),'permanent'=>$isPermanent];
+            $metadata[$fileName] = ['time'=>time(),'permanent'=>$isPermanent,'fav'=>false,'folder'=>$fileFolder,'downloads'=>0];
             file_put_contents($metaFile, json_encode($metadata, JSON_UNESCAPED_SLASHES));
             echo json_encode(['success'=>true,'completed'=>true]);
-        } else {
-            echo json_encode(['success'=>true,'completed'=>false]);
-        }
-    } else {
-        echo json_encode(['success'=>false,'error'=>'Upload failed']);
-    }
+        } else { echo json_encode(['success'=>true,'completed'=>false]); }
+    } else { echo json_encode(['success'=>false,'error'=>'Upload failed']); }
     exit;
 }
 
@@ -598,29 +574,25 @@ $texts = file_exists($textFile) ? json_decode(file_get_contents($textFile), true
 if (!is_array($texts)) $texts = [];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['text']) && !isset($_POST['chunk']) && !isset($_POST['edit_text'])) {
-    $isPermanent = !empty($_POST['text_permanent']) && $_POST['text_permanent'] === '1'; // [NEW]
+    $isPermanent = !empty($_POST['text_permanent']) && $_POST['text_permanent'] === '1';
     $texts[] = ['time'=>time(),'content'=>$_POST['text'],'permanent'=>$isPermanent];
     file_put_contents($textFile, json_encode($texts, JSON_UNESCAPED_SLASHES));
     header('Location: '.$selfUrl); exit;
 }
 
-/* ================== AUTO DELETE (respects permanent flag) ================== */
+/* ================== AUTO DELETE ================== */
 $oldTime = time() - (72*60*60);
 $metadataChanged = false;
 
-$allFilesInDir = array_diff(scandir($uploadDir), ['.','..','texts.json','chunks','metadata.json']);
+$allFilesInDir = array_diff(scandir($uploadDir), ['.','..','texts.json','chunks','metadata.json','shares.json','folders.json']);
 foreach ($allFilesInDir as $file) {
     $filePath = $uploadDir.'/'.$file;
     if (is_file($filePath) && !isset($metadata[$file])) {
-        $metadata[$file] = ['time'=>filemtime($filePath),'permanent'=>false];
-        $metadataChanged = true;
+        $metadata[$file] = ['time'=>filemtime($filePath),'permanent'=>false,'fav'=>false,'folder'=>'','downloads'=>0]; $metadataChanged = true;
     }
 }
-
 foreach ($metadata as $fileName => $rawMeta) {
-    $m = getMeta($metadata, $fileName);
-    $filePath = $uploadDir.'/'.$fileName;
-    // [MODIFIED] Only delete if NOT permanent and expired
+    $m = getMeta($metadata, $fileName); $filePath = $uploadDir.'/'.$fileName;
     if (!$m['permanent'] && $m['time'] < $oldTime) {
         if (file_exists($filePath)) @unlink($filePath);
         unset($metadata[$fileName]); $metadataChanged = true;
@@ -632,42 +604,34 @@ foreach ($metadata as $fileName => $rawMeta) {
 if ($metadataChanged) file_put_contents($metaFile, json_encode($metadata, JSON_UNESCAPED_SLASHES));
 
 $chunkFiles = @scandir($chunksDir);
-if ($chunkFiles) {
-    foreach ($chunkFiles as $chunk) {
-        if ($chunk==='.'||$chunk==='..') continue;
-        $cp = $chunksDir.'/'.$chunk;
-        if (@filemtime($cp) < time()-3600) @unlink($cp);
-    }
-}
+if ($chunkFiles) { foreach ($chunkFiles as $chunk) { if ($chunk==='.'||$chunk==='..') continue; $cp=$chunksDir.'/'.$chunk; if (@filemtime($cp)<time()-3600)@unlink($cp); } }
 
-// [MODIFIED] Auto-delete texts: skip permanent ones
 $oldTexts = $texts;
-$texts = array_filter($texts, function($item) use ($oldTime) {
-    return !empty($item['permanent']) || (isset($item['time']) && $item['time'] >= $oldTime);
-});
-if (count($texts) !== count($oldTexts)) {
-    file_put_contents($textFile, json_encode(array_values($texts), JSON_UNESCAPED_SLASHES));
-}
+$texts = array_filter($texts, function($item) use ($oldTime) { return !empty($item['permanent']) || (isset($item['time']) && $item['time'] >= $oldTime); });
+if (count($texts) !== count($oldTexts)) { file_put_contents($textFile, json_encode(array_values($texts), JSON_UNESCAPED_SLASHES)); }
 
 /* ================== VIEW DATA PREP ================== */
-
-/* Build grouped data structures */
 $filesByDate = [];
-$allFiles = array_diff(scandir($uploadDir), ['.','..','texts.json','chunks','metadata.json']);
+$allFiles = array_diff(scandir($uploadDir), ['.','..','texts.json','chunks','metadata.json','shares.json','folders.json']);
+
+// Compute stats
+$totalStorageBytes = 0;
+$totalDownloads = 0;
+$favFiles = [];
+
 foreach ($allFiles as $file) {
     $filePath = $uploadDir.'/'.$file;
     if (is_file($filePath)) {
         $m = getMeta($metadata, $file);
         $cat = getDateCategory($m['time'] ?: filemtime($filePath));
         if (!isset($filesByDate[$cat])) $filesByDate[$cat] = [];
-        $filesByDate[$cat][] = ['name'=>$file,'path'=>$filePath,'time'=>$m['time'],'permanent'=>$m['permanent']];
+        $filesByDate[$cat][] = ['name'=>$file,'path'=>$filePath,'time'=>$m['time'],'permanent'=>$m['permanent'],'fav'=>$m['fav'],'folder'=>$m['folder'],'downloads'=>$m['downloads']];
+        $totalStorageBytes += filesize($filePath);
+        $totalDownloads += $m['downloads'];
+        if ($m['fav']) $favFiles[] = $file;
     }
 }
-uksort($filesByDate, function($a,$b){
-    if($a==='Today')return -1;if($b==='Today')return 1;
-    if($a==='Yesterday')return -1;if($b==='Yesterday')return 1;
-    return strtotime($b)-strtotime($a);
-});
+uksort($filesByDate, function($a,$b){ if($a==='Today')return -1;if($b==='Today')return 1;if($a==='Yesterday')return -1;if($b==='Yesterday')return 1;return strtotime($b)-strtotime($a); });
 
 $textsByDate = [];
 foreach ($texts as $index => $item) {
@@ -675,43 +639,46 @@ foreach ($texts as $index => $item) {
     if (!isset($textsByDate[$cat])) $textsByDate[$cat] = [];
     $textsByDate[$cat][] = ['index'=>$index,'content'=>$item['content'],'time'=>$item['time'],'permanent'=>!empty($item['permanent'])];
 }
-uksort($textsByDate, function($a,$b){
-    if($a==='Today')return -1;if($b==='Today')return 1;
-    if($a==='Yesterday')return -1;if($b==='Yesterday')return 1;
-    return strtotime($b)-strtotime($a);
-});
+uksort($textsByDate, function($a,$b){ if($a==='Today')return -1;if($b==='Today')return 1;if($a==='Yesterday')return -1;if($b==='Yesterday')return 1;return strtotime($b)-strtotime($a); });
 
 $protocol = (!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off')?"https://":"http://";
 $currentURL = $protocol.$_SERVER['HTTP_HOST'].$selfUrl;
 $totalFiles = count($allFiles);
 $totalTexts = count($texts);
+$totalStorageFmt = formatFileSize($totalStorageBytes);
+
+// Build shares index (file => tokens)
+$fileShares = [];
+foreach ($shares as $tok => $s) {
+    if (!empty($s['file'])) $fileShares[$s['file']][] = $tok;
+}
 ?><!DOCTYPE html>
 <?php
-// Read theme from cookie set by JS — prevents flash after server-side redirects
 $htmlTheme = 'dark';
-if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','light'])) {
-    $htmlTheme = $_COOKIE['ft_theme'];
-}
+if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','light'])) $htmlTheme = $_COOKIE['ft_theme'];
 ?>
-<html lang="en" data-theme="<?= $htmlTheme ?>"><?php // theme set server-side — no FOUC even before JS ?>
+<html lang="en" data-theme="<?= $htmlTheme ?>">
 <head>
-    <!-- CRITICAL: Apply theme synchronously before ANY rendering to prevent dark→light flash -->
     <script>
     (function(){
-        // Read from both localStorage AND cookie (cookie survives hard reload)
-        var ls = localStorage.getItem('ft_theme');
-        var ck = (document.cookie.match(/(?:^|;\s*)ft_theme=([^;]+)/)||[])[1];
-        var t = ls || ck || 'dark';
-        document.documentElement.setAttribute('data-theme', t);
-        // Keep them in sync
-        if (!ck || ck !== t) document.cookie = 'ft_theme=' + t + ';path=/;max-age=31536000;samesite=Lax';
-        if (!ls) localStorage.setItem('ft_theme', t);
+        var ls=localStorage.getItem('ft_theme');
+        var ck=(document.cookie.match(/(?:^|;\s*)ft_theme=([^;]+)/)||[])[1];
+        var t=ls||ck||'dark';
+        document.documentElement.setAttribute('data-theme',t);
+        if(!ck||ck!==t)document.cookie='ft_theme='+t+';path=/;max-age=31536000;samesite=Lax';
+        if(!ls)localStorage.setItem('ft_theme',t);
     })();
     </script>
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>⚡ Fast Transfer</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&display=swap" rel="stylesheet">
+    <!-- PWA Manifest inline -->
+    <link rel="manifest" href="data:application/json;charset=utf-8,<?= urlencode(json_encode(['name'=>'Fast Transfer','short_name'=>'Transfer','start_url'=>'/','display'=>'standalone','background_color'=>'#0d0d18','theme_color'=>'#7c6aff','icons'=>[['src'=>'https://api.iconify.design/twemoji:zap.svg','sizes'=>'192x192','type'=>'image/svg+xml']]])) ?>">
+    <meta name="theme-color" content="#7c6aff">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Fast Transfer">
     <style>
     /* ========== CSS VARIABLES ========== */
     :root {
@@ -720,7 +687,7 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
         --border:rgba(255,255,255,.08); --border2:rgba(255,255,255,.13);
         --accent:#7c6aff; --accent2:#a78bfa;
         --accent-g:linear-gradient(135deg,#7c6aff,#a78bfa);
-        --green:#34d399; --red:#f87171; --yellow:#fbbf24;
+        --green:#34d399; --red:#f87171; --yellow:#fbbf24; --orange:#fb923c;
         --text:#e8e6f4; --text2:#a9a7bb; --muted:#5e5c72;
         --shadow:0 8px 32px rgba(0,0,0,.45);
         --r:16px; --rsm:10px; --rxs:7px;
@@ -733,7 +700,6 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
         --text:#1a1830; --text2:#4a4866; --muted:#c8c4e3;
         --shadow:0 4px 24px rgba(80,60,180,.1);
     }
-    /* ========== RESET ========== */
     *{margin:0;padding:0;box-sizing:border-box}
     html{scroll-behavior:smooth}
     body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:24px 16px 60px;overflow-x:hidden;position:relative}
@@ -745,7 +711,7 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     .container{max-width:1180px;margin:0 auto;position:relative;z-index:1}
 
     /* ========== HEADER ========== */
-    .site-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;gap:12px;flex-wrap:wrap}
+    .site-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;gap:12px;flex-wrap:wrap}
     .site-title{font-family:'Syne',sans-serif;font-weight:800;font-size:clamp(20px,4vw,28px);background:var(--accent-g);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
     .header-r{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
     .url-pill{display:inline-flex;align-items:center;gap:7px;background:var(--card);border:1px solid var(--border);border-radius:999px;padding:6px 14px;font-size:12px;color:var(--text2);max-width:240px;overflow:hidden;white-space:nowrap}
@@ -755,14 +721,28 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     .logout-btn{padding:7px 14px;width:auto;border-radius:999px;font-size:13px;font-weight:500;display:flex;align-items:center;gap:6px;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.2);color:var(--red)}
     .logout-btn:hover{background:rgba(248,113,113,.2)}
 
+    /* ========== SEARCH BAR ========== */
+    .search-bar{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+    .search-wrap{flex:1;min-width:200px;position:relative}
+    .search-wrap svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none}
+    #searchInput{width:100%;padding:9px 12px 9px 36px;background:var(--card);border:1px solid var(--border2);border-radius:var(--rsm);font-size:13px;color:var(--text);outline:none;transition:border-color var(--tr),box-shadow var(--tr)}
+    #searchInput:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,106,255,.12)}
+    #searchInput::placeholder{color:var(--muted)}
+    .filter-chips{display:flex;gap:6px;flex-wrap:wrap}
+    .fchip{padding:5px 12px;border-radius:999px;border:1px solid var(--border2);background:var(--card);font-size:12px;color:var(--text2);cursor:pointer;transition:background var(--tr),color var(--tr),border-color var(--tr)}
+    .fchip.active{background:rgba(124,106,255,.18);color:var(--accent2);border-color:rgba(124,106,255,.3)}
+
     /* ========== SECTIONS ========== */
     .section{background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--border);border-radius:var(--r);padding:22px;margin-bottom:18px;box-shadow:var(--shadow);transition:border-color var(--tr)}
     .section:hover{border-color:var(--border2)}
     .sec-title{font-family:'Syne',sans-serif;font-weight:700;font-size:15px;color:var(--text);margin-bottom:16px;display:flex;align-items:center;gap:8px}
+    .sec-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;gap:10px;flex-wrap:wrap}
+    .sec-head .sec-title{margin-bottom:0}
 
     /* ========== STATS ========== */
     .stats-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:18px;font-size:12px;color:var(--text2)}
-    .stat-chip{display:flex;align-items:center;gap:5px;background:var(--card);border:1px solid var(--border);border-radius:999px;padding:5px 12px}
+    .stat-chip{display:flex;align-items:center;gap:5px;background:var(--card);border:1px solid var(--border);border-radius:999px;padding:5px 12px;transition:border-color var(--tr)}
+    .stat-chip:hover{border-color:var(--border2)}
     .stat-chip strong{color:var(--text);font-weight:700}
 
     /* ========== DROP ZONE ========== */
@@ -774,7 +754,7 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     .drop-zone small{font-size:12px;color:var(--muted)}
     #fileInput{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
 
-    /* ========== TOGGLE (Keep Forever) ========== */
+    /* ========== TOGGLE ========== */
     .toggle-row{display:inline-flex;align-items:center;gap:9px;background:rgba(124,106,255,.06);border:1px solid rgba(124,106,255,.14);border-radius:var(--rxs);padding:7px 13px;font-size:13px;color:var(--text2);user-select:none;cursor:pointer;transition:background var(--tr)}
     .toggle-row:hover{background:rgba(124,106,255,.11)}
     .toggle-track{width:34px;height:19px;border-radius:999px;background:var(--muted);position:relative;transition:background var(--tr);flex-shrink:0}
@@ -791,9 +771,16 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     .btn-green{background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.22)}
     .btn-red{background:rgba(248,113,113,.1);color:var(--red);border:1px solid rgba(248,113,113,.18)}
     .btn-ghost{background:var(--card);color:var(--text2);border:1px solid var(--border2)}
+    .btn-accent{background:rgba(124,106,255,.15);color:var(--accent2);border:1px solid rgba(124,106,255,.25)}
     .btn-sm{padding:5px 11px;font-size:12px}
-    .btn-perm-on{background:rgba(124,106,255,.18);color:var(--accent2);border:1px solid rgba(124,106,255,.3)}
-    .btn-perm-off{background:var(--card);color:var(--muted);border:1px solid var(--border)}
+
+    /* ========== FOLDER TABS ========== */
+    .folder-tabs{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:16px}
+    .ftab{padding:6px 14px;border-radius:999px;border:1px solid var(--border2);background:var(--card);font-size:12px;font-weight:600;color:var(--text2);cursor:pointer;transition:background var(--tr),color var(--tr),border-color var(--tr);display:flex;align-items:center;gap:5px}
+    .ftab.active{background:rgba(124,106,255,.18);color:var(--accent2);border-color:rgba(124,106,255,.3)}
+    .ftab:hover:not(.active){background:var(--card-hov);color:var(--text)}
+    .ftab .tab-del{width:14px;height:14px;border-radius:50%;background:rgba(248,113,113,.2);color:var(--red);display:flex;align-items:center;justify-content:center;font-size:10px;line-height:1;transition:background var(--tr)}
+    .ftab .tab-del:hover{background:rgba(248,113,113,.5)}
 
     /* ========== PROGRESS ========== */
     .progress-wrap{display:none;margin-top:12px}
@@ -807,6 +794,8 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     textarea{width:100%;padding:13px;background:rgba(255,255,255,.04);border:1px solid var(--border2);border-radius:var(--rsm);font-size:14px;color:var(--text);resize:vertical;min-height:88px;transition:border-color var(--tr),box-shadow var(--tr);outline:none;line-height:1.6}
     textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,106,255,.12)}
     textarea::placeholder{color:var(--muted)}
+    input[type=text],input[type=number]{background:rgba(255,255,255,.04);border:1px solid var(--border2);border-radius:var(--rxs);padding:8px 12px;color:var(--text);font-size:13px;outline:none;transition:border-color var(--tr)}
+    input[type=text]:focus,input[type=number]:focus{border-color:var(--accent)}
 
     /* ========== DATE GROUPS ========== */
     .date-group{margin-bottom:26px}
@@ -819,17 +808,15 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     .files{display:grid;grid-template-columns:repeat(auto-fill,minmax(205px,1fr));gap:13px}
     .file-card{background:var(--card);border:1px solid var(--border);border-radius:var(--rsm);overflow:hidden;position:relative;transition:transform var(--tr),border-color var(--tr),box-shadow var(--tr);display:flex;flex-direction:column}
     .file-card:hover{transform:translateY(-3px);border-color:var(--border2);box-shadow:0 12px 30px rgba(0,0,0,.3)}
+    .file-card.is-fav{border-color:rgba(251,191,36,.3)}
 
     .file-thumb{width:100%;height:142px;background:rgba(255,255,255,.03);display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative;cursor:pointer;flex-shrink:0}
     .file-thumb img{width:100%;height:100%;object-fit:cover;transition:transform .35s}
     .file-card:hover .file-thumb img{transform:scale(1.04)}
     .file-thumb video{width:100%;height:100%;object-fit:cover}
-    .file-thumb iframe{width:100%;height:100%;border:none;pointer-events:none}
     .file-icon-big{font-size:40px;display:flex;flex-direction:column;align-items:center;gap:7px}
     .file-icon-big span{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-family:'Syne',sans-serif}
-
     .audio-thumb{width:100%;height:142px;background:linear-gradient(135deg,rgba(124,106,255,.14),rgba(167,139,250,.08));display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:10px}
-    .audio-thumb audio{width:100%;height:34px}
 
     .prev-overlay{position:absolute;inset:0;background:rgba(0,0,0,.42);display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity var(--tr)}
     .file-thumb:hover .prev-overlay{opacity:1}
@@ -843,18 +830,28 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     .file-dl-btn{flex:1;padding:7px;background:var(--accent-g);color:#fff;border:none;border-radius:var(--rxs);font-size:11px;font-weight:700;text-align:center;display:block;transition:opacity var(--tr),transform var(--tr)}
     .file-dl-btn:hover{opacity:.84;transform:translateY(-1px)}
 
+    /* File card overlay buttons */
     .card-del{position:absolute;top:7px;right:7px;background:rgba(248,113,113,.16);backdrop-filter:blur(4px);color:var(--red);border:1px solid rgba(248,113,113,.22);padding:5px;border-radius:7px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;z-index:10;transition:background var(--tr),transform var(--tr)}
     .card-del:hover{background:rgba(248,113,113,.32);transform:scale(1.08)}
     .card-del svg{width:13px;height:13px}
-    .card-perm{position:absolute;top:7px;left:7px;background:rgba(0,0,0,.32);backdrop-filter:blur(4px);color:var(--muted);border:1px solid transparent;padding:3px 8px;border-radius:999px;font-size:10px;font-weight:700;z-index:10;transition:background var(--tr),color var(--tr),border-color var(--tr);white-space:nowrap}
-    .card-perm.on{background:rgba(124,106,255,.22);color:var(--accent2);border-color:rgba(124,106,255,.32)}
-    .card-perm:hover{background:rgba(124,106,255,.28);color:var(--accent2)}
+    .card-fav{position:absolute;top:38px;right:7px;backdrop-filter:blur(4px);border:1px solid transparent;padding:3px;border-radius:7px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;z-index:10;transition:background var(--tr),transform var(--tr);background:rgba(0,0,0,.35);color:var(--muted);font-size:14px;text-decoration:none}
+    .card-fav:hover{background:rgba(251,191,36,.2);transform:scale(1.08)}
+    .card-fav.on{background:rgba(251,191,36,.22);color:var(--yellow)}
+    .card-share{position:absolute;top:69px;right:7px;backdrop-filter:blur(4px);border:1px solid transparent;padding:3px;border-radius:7px;width:28px;height:28px;display:flex;align-items:center;justify-content:center;z-index:10;transition:background var(--tr),transform var(--tr);background:rgba(0,0,0,.35);color:var(--muted);font-size:13px;text-decoration:none;cursor:pointer}
+    .card-share:hover{background:rgba(124,106,255,.25);color:var(--accent2);transform:scale(1.08)}
+    .card-share.has-share{background:rgba(52,211,153,.18);color:var(--green)}
+
+    .card-perm{position:absolute;top:7px;left:7px;backdrop-filter:blur(4px);padding:3px 8px;border-radius:999px;font-size:10px;font-weight:700;z-index:10;transition:background var(--tr),color var(--tr),border-color var(--tr);white-space:nowrap;text-decoration:none;display:flex;align-items:center;gap:3px;background:rgba(0,0,0,.42);color:var(--muted);border:1px solid transparent}
+    .card-perm.perm{background:rgba(124,106,255,.25);color:var(--accent2);border-color:rgba(124,106,255,.35)}
+    .card-perm.soon{background:rgba(248,113,113,.22);color:var(--red);border-color:rgba(248,113,113,.3)}
+    .card-perm.mid{background:rgba(251,191,36,.18);color:var(--yellow);border-color:rgba(251,191,36,.28)}
+    .card-perm.ok{background:rgba(0,0,0,.42);color:var(--muted);border:1px solid transparent}
+    .card-perm:hover{background:rgba(124,106,255,.3);color:var(--accent2)}
 
     /* ========== TEXT CARDS ========== */
     .texts-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:13px;align-items:start}
     .text-item{background:var(--card);border:1px solid var(--border);border-radius:var(--rsm);padding:13px;display:flex;flex-direction:column;gap:9px;transition:transform var(--tr),border-color var(--tr),box-shadow var(--tr)}
     .text-item:hover{transform:translateY(-2px);border-color:var(--border2);box-shadow:0 8px 22px rgba(0,0,0,.22)}
-    /* URL cards: don't add extra padding/space, preview is self-contained */
     .text-item.is-url{padding:10px}
     .text-item.is-url .url-preview-wrap{margin:-2px -2px 0}
     .url-preview-wrap{overflow:hidden;border-radius:var(--rxs)}
@@ -870,84 +867,42 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     .tact svg{width:13px;height:13px;pointer-events:none}
 
     /* ========== COUNTDOWN TIMER BADGE ========== */
-    .ttl-badge{
-        display:inline-flex;align-items:center;gap:4px;
-        border-radius:999px;padding:3px 9px;font-size:10px;font-weight:700;
-        white-space:nowrap;cursor:pointer;
-        transition:background var(--tr),color var(--tr),border-color var(--tr);
-        text-decoration:none;border:1px solid transparent;
-    }
+    .ttl-badge{display:inline-flex;align-items:center;gap:4px;border-radius:999px;padding:3px 9px;font-size:10px;font-weight:700;white-space:nowrap;cursor:pointer;transition:background var(--tr),color var(--tr),border-color var(--tr);text-decoration:none;border:1px solid transparent}
     .ttl-badge.perm{background:rgba(124,106,255,.18);color:var(--accent2);border-color:rgba(124,106,255,.3)}
     .ttl-badge.soon{background:rgba(248,113,113,.15);color:var(--red);border-color:rgba(248,113,113,.25)}
     .ttl-badge.mid{background:rgba(251,191,36,.12);color:var(--yellow);border-color:rgba(251,191,36,.22)}
     .ttl-badge.ok{background:var(--card);color:var(--muted);border-color:var(--border)}
     .ttl-badge:hover{opacity:.8}
-    /* File card perm badge */
-    .card-perm{position:absolute;top:7px;left:7px;backdrop-filter:blur(4px);padding:3px 8px;border-radius:999px;font-size:10px;font-weight:700;z-index:10;transition:background var(--tr),color var(--tr),border-color var(--tr);white-space:nowrap;text-decoration:none;display:flex;align-items:center;gap:3px;background:rgba(0,0,0,.42);color:var(--muted);border:1px solid transparent}
-    .card-perm.perm{background:rgba(124,106,255,.25);color:var(--accent2);border-color:rgba(124,106,255,.35)}
-    .card-perm.soon{background:rgba(248,113,113,.22);color:var(--red);border-color:rgba(248,113,113,.3)}
-    .card-perm.mid{background:rgba(251,191,36,.18);color:var(--yellow);border-color:rgba(251,191,36,.28)}
-    .card-perm.ok{background:rgba(0,0,0,.42);color:var(--muted);border:1px solid transparent}
-    .card-perm:hover{background:rgba(124,106,255,.3);color:var(--accent2)}
 
     /* ========== IMAGE ZOOM VIEWER ========== */
     .img-viewer{position:relative;width:100%;display:flex;flex-direction:column;gap:10px}
-    .img-viewer-wrap{
-        overflow:hidden;border-radius:var(--rxs);
-        background:rgba(0,0,0,.3);
-        display:flex;align-items:center;justify-content:center;
-        max-height:65vh;min-height:200px;
-        cursor:grab;user-select:none;
-    }
+    .img-viewer-wrap{overflow:hidden;border-radius:var(--rxs);background:rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;max-height:65vh;min-height:200px;cursor:grab;user-select:none}
     .img-viewer-wrap:active{cursor:grabbing}
-    .img-viewer-wrap img{
-        max-width:100%;max-height:65vh;
-        object-fit:contain;border-radius:var(--rxs);
-        transition:transform .15s ease;
-        transform-origin:center center;
-        pointer-events:none;
-    }
-    .img-controls{
-        display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;
-    }
-    .img-ctrl-btn{
-        width:34px;height:34px;border-radius:8px;
-        background:var(--card);border:1px solid var(--border2);
-        color:var(--text2);display:flex;align-items:center;justify-content:center;
-        cursor:pointer;font-size:16px;transition:background var(--tr),color var(--tr);
-        flex-shrink:0;
-    }
+    .img-viewer-wrap img{max-width:100%;max-height:65vh;object-fit:contain;border-radius:var(--rxs);transition:transform .15s ease;transform-origin:center center;pointer-events:none}
+    .img-controls{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
+    .img-ctrl-btn{width:34px;height:34px;border-radius:8px;background:var(--card);border:1px solid var(--border2);color:var(--text2);display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:16px;transition:background var(--tr),color var(--tr);flex-shrink:0}
     .img-ctrl-btn:hover{background:var(--card-hov);color:var(--text)}
     .img-zoom-label{font-size:12px;color:var(--text2);min-width:42px;text-align:center;font-weight:600}
 
     /* ========== VIDEO SEEK CONTROLS ========== */
     .vid-wrap{position:relative;width:100%;border-radius:var(--rxs);overflow:hidden;background:#000}
     .vid-wrap video{width:100%;max-height:65vh;display:block}
-    .vid-seek-bar{
-        display:flex;align-items:center;justify-content:center;gap:8px;
-        padding:8px 6px 2px;flex-wrap:wrap;
-    }
-    .seek-btn{
-        display:flex;align-items:center;gap:4px;
-        background:var(--card);border:1px solid var(--border2);
-        color:var(--text2);border-radius:8px;
-        padding:5px 12px;font-size:12px;font-weight:700;cursor:pointer;
-        transition:background var(--tr),color var(--tr);white-space:nowrap;
-    }
+    .vid-seek-bar{display:flex;align-items:center;justify-content:center;gap:8px;padding:8px 6px 2px;flex-wrap:wrap}
+    .seek-btn{display:flex;align-items:center;gap:4px;background:var(--card);border:1px solid var(--border2);color:var(--text2);border-radius:8px;padding:5px 12px;font-size:12px;font-weight:700;cursor:pointer;transition:background var(--tr),color var(--tr);white-space:nowrap}
     .seek-btn:hover{background:var(--card-hov);color:var(--text)}
     .vid-time-lbl{font-size:11px;color:var(--text2);margin:0 4px;min-width:90px;text-align:center}
+
+    /* ========== URL PREVIEW ========== */
     .url-preview-card{border-radius:var(--rxs);border:1px solid var(--border2);overflow:hidden;background:rgba(255,255,255,.03);display:block;transition:background var(--tr),border-color var(--tr);cursor:pointer}
     .url-preview-card:hover{background:rgba(255,255,255,.06);border-color:var(--accent)}
     .url-pimg{width:100%;height:112px;object-fit:cover;display:block}
     .url-pbody{padding:9px 11px;display:flex;flex-direction:column;gap:3px}
     .url-pdomain{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--muted);font-weight:500}
-    .url-pdomain img{width:13px;height:13px;border-radius:3px}
     .url-ptitle{font-size:12px;font-weight:600;color:var(--text);line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
     .url-pdesc{font-size:11px;color:var(--text2);line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
     .url-loader{display:flex;align-items:center;gap:8px;padding:9px;font-size:12px;color:var(--muted)}
     .spinner{width:13px;height:13px;border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
     @keyframes spin{to{transform:rotate(360deg)}}
-    .url-rawlink{font-size:11px;color:var(--accent2);word-break:break-all;text-decoration:underline;text-underline-offset:2px}
 
     /* ========== MODALS ========== */
     .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);backdrop-filter:blur(8px);z-index:2000;align-items:center;justify-content:center;padding:16px}
@@ -964,6 +919,31 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     .modal-body iframe{width:100%;height:65vh;border:none;border-radius:var(--rxs)}
     .modal-body pre{background:rgba(0,0,0,.28);border:1px solid var(--border);border-radius:var(--rxs);padding:14px;font-size:11px;color:var(--text2);overflow:auto;max-height:60vh;width:100%;white-space:pre-wrap;word-break:break-word;line-height:1.6}
     .modal-foot{display:flex;gap:7px;justify-content:flex-end}
+    /* Share modal */
+    .share-modal-box{max-width:480px}
+    .share-opt{display:flex;flex-direction:column;gap:12px}
+    .share-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+    .share-row label{font-size:12px;color:var(--text2);min-width:100px;font-weight:500}
+    .share-url-wrap{display:flex;gap:8px;align-items:center}
+    .share-url-box{flex:1;padding:9px 12px;background:rgba(124,106,255,.1);border:1px solid rgba(124,106,255,.25);border-radius:var(--rxs);font-size:12px;color:var(--accent2);word-break:break-all;font-family:monospace}
+    .share-chip{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border-radius:999px;border:1px solid var(--border2);background:var(--card);font-size:12px;color:var(--text2);cursor:pointer;transition:background var(--tr),color var(--tr),border-color var(--tr)}
+    .share-chip.active{background:rgba(124,106,255,.18);color:var(--accent2);border-color:rgba(124,106,255,.3)}
+    /* Folder modal */
+    .folder-modal-box{max-width:400px}
+
+    /* ========== TOAST NOTIFICATIONS ========== */
+    #toastContainer{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+    .toast{background:var(--bg2);border:1px solid var(--border2);border-radius:12px;padding:12px 18px;font-size:13px;color:var(--text);box-shadow:0 8px 24px rgba(0,0,0,.4);display:flex;align-items:center;gap:10px;pointer-events:all;animation:toastIn .25s cubic-bezier(.4,0,.2,1);max-width:320px;min-width:220px}
+    .toast.out{animation:toastOut .25s forwards}
+    .toast-icon{font-size:16px;flex-shrink:0}
+    .toast.ok{border-color:rgba(52,211,153,.25)}
+    .toast.ok .toast-icon::after{content:'✅'}
+    .toast.err{border-color:rgba(248,113,113,.25)}
+    .toast.err .toast-icon::after{content:'❌'}
+    .toast.info{border-color:rgba(124,106,255,.25)}
+    .toast.info .toast-icon::after{content:'📋'}
+    @keyframes toastIn{from{opacity:0;transform:translateY(16px) scale(.95)}to{opacity:1;transform:none}}
+    @keyframes toastOut{to{opacity:0;transform:translateY(8px) scale(.95)}}
 
     /* ========== MESSAGE ========== */
     .message{background:rgba(52,211,153,.09);color:var(--green);border:1px solid rgba(52,211,153,.22);border-radius:var(--rxs);padding:11px 14px;margin-bottom:14px;font-size:13px;text-align:center}
@@ -972,194 +952,95 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     .upload-opts{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;flex-wrap:wrap}
     .file-count-lbl{font-size:12px;color:var(--accent2);flex:1}
 
-    /* ========== RESPONSIVE — mobile-first ========== */
+    /* ========== FOLDER SELECT ========== */
+    .folder-select{padding:7px 10px;background:var(--card);border:1px solid var(--border2);border-radius:var(--rxs);color:var(--text2);font-size:12px;cursor:pointer;outline:none}
+    .folder-select:focus{border-color:var(--accent)}
 
-    /* --- base adjustments that apply to all small screens (phones + tablets) --- */
+    /* ========== EMPTY STATE ========== */
+    .empty-state{text-align:center;padding:36px 20px;color:var(--muted);font-size:13px}
+    .empty-state span{font-size:40px;display:block;margin-bottom:10px}
+
+    /* ========== RESPONSIVE ========== */
     @media(max-width:900px){
         body{padding:16px 12px 60px}
-
-        /* Header: stack title above controls on narrow screens */
-        .site-header{gap:10px;margin-bottom:20px}
+        .site-header{gap:10px;margin-bottom:16px}
         .header-r{gap:6px}
-
-        /* Sections */
         .section{padding:16px;border-radius:12px;margin-bottom:14px}
-
-        /* File grid: 2 columns on tablet */
         .files{grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:11px}
-
-        /* Text grid: 2 columns on tablet */
         .texts-grid{grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:11px}
-
-        /* Modals: less padding on smaller screens */
         .modal-box{padding:18px;gap:12px}
-        .modal-body iframe{height:55vh}
-        .modal-body video{max-height:55vh}
-        .img-viewer-wrap{max-height:55vh;min-height:160px}
-        .img-viewer-wrap img{max-height:55vh}
     }
-
-    /* --- phones landscape & small tablets (≤768px) --- */
     @media(max-width:768px){
-        /* Stats bar: wrap tightly */
         .stats-bar{gap:6px}
         .stat-chip{padding:4px 10px;font-size:11px}
-
-        /* Header controls: hide URL pill on small tablets, show on tap */
         .url-pill{max-width:180px;font-size:11px;padding:5px 11px}
-
-        /* Date group header: wrap gracefully */
         .date-header{flex-direction:row;flex-wrap:wrap;gap:8px}
         .btn-group{flex-wrap:wrap;gap:6px}
-
-        /* Drop zone: tighter */
         .drop-zone{padding:22px 16px}
-        .drop-zone .dz-icon{font-size:28px;margin-bottom:6px}
-        .drop-zone .dz-label{font-size:13px}
-
-        /* Upload options row: stack toggle below file count */
         .upload-opts{flex-direction:column;align-items:stretch;gap:8px}
         .toggle-row{width:100%;justify-content:center}
         .file-count-lbl{text-align:center}
-
-        /* File thumb height: slightly shorter */
         .file-thumb{height:130px}
-        .audio-thumb{height:130px}
     }
-
-    /* --- phones portrait (≤480px) --- */
     @media(max-width:480px){
         body{padding:12px 10px 70px}
-
-        /* Header: full width stacked layout */
         .site-header{flex-direction:column;align-items:stretch;gap:8px;margin-bottom:16px}
         .header-r{justify-content:space-between;width:100%}
-        /* Hide URL pill on tiny phones — wastes space */
         .url-pill{display:none}
-        /* Make logout text-less on tiny screens */
         .logout-btn .logout-text{display:none}
-
-        /* Title centred */
         .site-title{text-align:center;font-size:22px}
-
-        /* Stats bar: 2-column grid */
-        .stats-bar{
-            display:grid;
-            grid-template-columns:1fr 1fr;
-            gap:6px;
-            margin-bottom:14px;
-        }
+        .stats-bar{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:14px}
         .stat-chip{justify-content:center;font-size:11px;padding:5px 8px;border-radius:8px}
-
-        /* Sections */
         .section{padding:13px;border-radius:10px;margin-bottom:12px}
         .sec-title{font-size:14px;margin-bottom:12px}
-
-        /* Date header: full-width stack */
         .date-header{flex-direction:column;align-items:flex-start;gap:8px}
         .btn-group{width:100%;display:grid;grid-template-columns:1fr 1fr;gap:6px}
         .btn-group .btn{width:100%;justify-content:center}
-        .btn-sm{padding:8px 10px;font-size:12px} /* bigger tap target on phone */
-
-        /* File grid: 2 columns, fill screen */
+        .btn-sm{padding:8px 10px;font-size:12px}
         .files{grid-template-columns:repeat(2,1fr);gap:9px}
         .file-thumb{height:115px}
-        .audio-thumb{height:115px}
         .file-body{padding:9px}
         .file-name{font-size:11px}
         .file-meta-row{font-size:10px;margin-bottom:7px}
         .file-dl-btn{padding:7px 6px;font-size:11px}
-        /* card-perm badge: shorter text on tiny screen */
         .card-perm{font-size:9px;padding:2px 6px}
         .card-del{width:26px;height:26px}
-        .card-del svg{width:12px;height:12px}
-
-        /* Text grid: single column */
         .texts-grid{grid-template-columns:1fr;gap:9px}
         .text-item{padding:11px;gap:8px}
-        .text-content{font-size:13px}
-        /* Action row: tighter */
-        .text-actions-row{gap:5px;flex-wrap:wrap}
-        .tact{width:30px;height:30px} /* bigger tap targets */
-        .ttl-badge{padding:4px 8px;font-size:10px}
-
-        /* Drop zone */
-        .drop-zone{padding:18px 12px}
-        .drop-zone .dz-icon{font-size:26px}
-        .drop-zone .dz-label{font-size:12px}
-        .drop-zone small{font-size:11px}
-
-        /* Textarea */
-        textarea{font-size:14px;min-height:80px;padding:11px}
-
-        /* Buttons: full-width primary, bigger tap area */
         .btn-primary{padding:13px;font-size:15px}
-
-        /* Modals: full-screen sheet on phones */
         .modal-overlay{padding:0;align-items:flex-end}
-        .modal-box{
-            border-radius:16px 16px 0 0;
-            max-height:95vh;
-            max-width:100%;
-            padding:16px;
-            gap:10px;
-            /* slide up animation */
-            animation:sheetIn .22s cubic-bezier(.4,0,.2,1);
-        }
+        .modal-box{border-radius:16px 16px 0 0;max-height:95vh;max-width:100%;padding:16px;gap:10px;animation:sheetIn .22s cubic-bezier(.4,0,.2,1)}
         @keyframes sheetIn{from{transform:translateY(100%)}to{transform:translateY(0)}}
-        .modal-ttl{font-size:14px}
-        .modal-body{min-height:120px}
-        .modal-body iframe{height:50vh}
-        .modal-body video{max-height:45vh}
-        .img-viewer-wrap{max-height:45vh;min-height:140px}
-        .img-viewer-wrap img{max-height:45vh}
         .modal-foot{flex-direction:row;gap:8px}
         .modal-foot .btn{flex:1;padding:11px}
-        /* Image zoom controls: bigger tap targets */
         .img-ctrl-btn{width:40px;height:40px;font-size:18px}
-        .img-zoom-label{font-size:13px}
-        /* Video seek buttons: bigger */
         .seek-btn{padding:8px 14px;font-size:13px}
-        .vid-time-lbl{font-size:12px}
+        #toastContainer{bottom:16px;right:12px;left:12px}
+        .toast{max-width:100%}
     }
-
-    /* --- very small phones (≤360px) --- */
     @media(max-width:360px){
         body{padding:10px 8px 70px}
         .files{grid-template-columns:repeat(2,1fr);gap:7px}
         .file-thumb{height:100px}
-        .audio-thumb{height:100px}
         .stat-chip{font-size:10px;padding:4px 6px}
         .section{padding:11px}
-        .btn-group{grid-template-columns:1fr} /* single column on tiny */
     }
-
-    /* --- tablet portrait (481–768px) specific refinements --- */
     @media(min-width:481px) and (max-width:768px){
         .files{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}
         .texts-grid{grid-template-columns:repeat(2,1fr)}
-        .modal-overlay{padding:12px}
-        .modal-box{border-radius:var(--r)}
     }
-
-    /* --- tablet landscape / small desktop (769–1024px) --- */
-    @media(min-width:769px) and (max-width:1024px){
-        body{padding:20px 18px 60px}
-        .files{grid-template-columns:repeat(auto-fill,minmax(185px,1fr))}
-        .texts-grid{grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
-    }
-
-    /* Touch device: always show preview overlay (no hover on touch) */
     @media(hover:none){
         .prev-overlay{opacity:1;background:rgba(0,0,0,.25)}
         .prev-btn{font-size:11px;padding:5px 12px}
         .file-card:hover{transform:none;box-shadow:none}
         .text-item:hover{transform:none;box-shadow:none}
-        .file-thumb:hover .prev-overlay{opacity:1}
     }
     </style>
 </head>
 <body>
+<!-- Toast Container -->
+<div id="toastContainer"></div>
+
 <div class="container">
 
 <!-- HEADER -->
@@ -1181,12 +1062,30 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
 <!-- STATS -->
 <div class="stats-bar">
     <div class="stat-chip">📁 <strong><?= $totalFiles ?></strong> files</div>
+    <div class="stat-chip">💾 <strong><?= $totalStorageFmt ?></strong> used</div>
     <div class="stat-chip">📋 <strong><?= $totalTexts ?></strong> texts</div>
-    <div class="stat-chip">🗑️ Auto-delete <strong>72h</strong> (unless permanent)</div>
-    <div class="stat-chip">📦 Max <strong>200MB</strong></div>
+    <div class="stat-chip">⬇ <strong><?= $totalDownloads ?></strong> downloads</div>
+    <div class="stat-chip">🗑️ Auto-delete <strong>72h</strong></div>
+    <?php if (!empty($favFiles)): ?>
+    <div class="stat-chip">⭐ <strong><?= count($favFiles) ?></strong> favorites</div>
+    <?php endif; ?>
 </div>
 
-<?php if (isset($message)): ?><div class="message"><?= h($message) ?></div><?php endif; ?>
+<!-- SEARCH & FILTERS -->
+<div class="search-bar">
+    <div class="search-wrap">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="searchInput" placeholder="Search files by name…" oninput="filterFiles()" autocomplete="off">
+    </div>
+    <div class="filter-chips" id="filterChips">
+        <span class="fchip active" data-type="all" onclick="setFilter(this,'all')">All</span>
+        <span class="fchip" data-type="image" onclick="setFilter(this,'image')">🖼 Images</span>
+        <span class="fchip" data-type="video" onclick="setFilter(this,'video')">🎬 Video</span>
+        <span class="fchip" data-type="audio" onclick="setFilter(this,'audio')">🎵 Audio</span>
+        <span class="fchip" data-type="document" onclick="setFilter(this,'document')">📄 Docs</span>
+        <span class="fchip" data-type="fav" onclick="setFilter(this,'fav')">⭐ Favorites</span>
+    </div>
+</div>
 
 <!-- UPLOAD FILES -->
 <div class="section">
@@ -1197,17 +1096,24 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     <form id="uploadForm">
         <div id="dropZone" class="drop-zone">
             <span class="dz-icon">📂</span>
-            <div class="dz-label">Drag &amp; drop files here</div>
-            <small>or click to select · max 200MB per file</small>
+            <div class="dz-label">Drag &amp; drop files here or paste (Ctrl+V)</div>
+            <small>click to select · max 200MB per file</small>
         </div>
         <input type="file" id="fileInput" multiple>
         <div class="upload-opts">
             <span class="file-count-lbl" id="fileCount"></span>
-            <!-- [NEW] Keep Forever toggle for uploads — default OFF -->
-            <label class="toggle-row" id="filePermToggle" title="Keep files forever — skip 72h auto-delete">
+            <label class="toggle-row" id="filePermToggle" title="Keep files forever">
                 <div class="toggle-track"></div>
                 <span>Keep Forever</span>
             </label>
+            <?php if (!empty($folders)): ?>
+            <select class="folder-select" id="uploadFolderSelect">
+                <option value="">📁 No folder</option>
+                <?php foreach ($folders as $f): ?>
+                <option value="<?= h($f) ?>"><?= h($f) ?></option>
+                <?php endforeach; ?>
+            </select>
+            <?php endif; ?>
         </div>
         <button type="submit" class="btn btn-primary" id="uploadBtn">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
@@ -1227,12 +1133,11 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
         Save Text or URL
     </div>
     <form id="textForm" method="POST">
-        <textarea name="text" id="textArea" placeholder="Paste text or a URL — URLs get a rich WhatsApp-style preview…" required></textarea>
+        <textarea name="text" id="textArea" placeholder="Paste text or a URL — URLs get a rich preview… (also try Ctrl+V to paste screenshots as files)" required></textarea>
         <input type="hidden" name="text_permanent" id="textPermInput" value="0">
         <div class="upload-opts">
             <span style="font-size:12px;color:var(--muted)">URLs auto-detected &amp; previewed.</span>
-            <!-- [NEW] Keep Forever toggle for text — default OFF -->
-            <label class="toggle-row" id="textPermToggle" title="Keep text forever — skip 72h auto-delete">
+            <label class="toggle-row" id="textPermToggle" title="Keep text forever">
                 <div class="toggle-track"></div>
                 <span>Keep Forever</span>
             </label>
@@ -1242,6 +1147,26 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
             Save
         </button>
     </form>
+</div>
+
+<!-- FOLDERS SECTION -->
+<div class="section">
+    <div class="sec-head">
+        <div class="sec-title">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            Folders
+        </div>
+        <button class="btn btn-accent btn-sm" onclick="openFolderModal()">+ New Folder</button>
+    </div>
+    <div class="folder-tabs" id="folderTabs">
+        <span class="ftab active" data-folder="__all__" onclick="setFolderTab(this,'__all__')">📁 All Files</span>
+        <?php foreach ($folders as $f): ?>
+        <span class="ftab" data-folder="<?= h($f) ?>" onclick="setFolderTab(this,'<?= h(addslashes($f)) ?>')">
+            📂 <?= h($f) ?>
+            <a href="?delete_folder=<?= urlencode($f) ?>" class="tab-del" onclick="event.stopPropagation();return confirm('Delete folder <?= h(addslashes($f)) ?>? Files will be moved to All.')" title="Delete folder">×</a>
+        </span>
+        <?php endforeach; ?>
+    </div>
 </div>
 
 <!-- SAVED TEXTS -->
@@ -1258,8 +1183,7 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
                 <?= h($dateCategory) ?> <span class="date-count"><?= count($dateTexts) ?></span>
             </div>
-            <a href="?delete_texts_day=<?= urlencode($dateCategory) ?>" class="btn btn-red btn-sm"
-               onclick="return confirm('Delete all texts from <?= h($dateCategory) ?>?')">🗑️ Delete Day</a>
+            <a href="?delete_texts_day=<?= urlencode($dateCategory) ?>" class="btn btn-red btn-sm" onclick="return confirm('Delete all texts from <?= h($dateCategory) ?>?')">🗑️ Delete Day</a>
         </div>
         <div class="texts-grid">
         <?php foreach ($dateTexts as $textData):
@@ -1270,7 +1194,6 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
         ?>
         <div class="text-item<?= $isUrl?' is-url':'' ?>">
             <?php if ($isUrl): ?>
-                <!-- URL preview loaded async by JS; raw link shown briefly then hidden on success -->
                 <div class="url-preview-wrap" data-url="<?= h(trim($content)) ?>">
                     <div class="url-loader"><div class="spinner"></div> Loading preview…</div>
                 </div>
@@ -1279,14 +1202,7 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
             <?php endif; ?>
             <div class="text-actions-row">
                 <span class="text-time"><?= date('H:i', $textData['time']) ?></span>
-                <!-- Countdown / Permanent toggle -->
-                <a href="?toggle_perm_text=<?= (int)$textData['index'] ?>"
-                   class="ttl-badge <?= $isPerm?'perm':'' ?>"
-                   data-expires="<?= $isPerm ? '0' : ($textData['time'] + 72*60*60) ?>"
-                   data-perm="<?= $isPerm?'1':'0' ?>"
-                   title="Click to toggle permanent">
-                    <?= $isPerm ? '🔒 Perm' : '' ?>
-                </a>
+                <a href="?toggle_perm_text=<?= (int)$textData['index'] ?>" class="ttl-badge <?= $isPerm?'perm':'' ?>" data-expires="<?= $isPerm ? '0' : ($textData['time'] + 72*60*60) ?>" data-perm="<?= $isPerm?'1':'0' ?>" title="Click to toggle permanent"><?= $isPerm ? '🔒 Perm' : '' ?></a>
                 <?php if ($canEdit): ?>
                 <button class="tact edit" onclick="openEditModal(<?= (int)$textData['index'] ?>)" title="Edit">
                     <svg fill="currentColor" viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
@@ -1310,32 +1226,36 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
 
 <!-- FILES -->
 <?php if (!empty($filesByDate)): ?>
-<div class="section">
+<div class="section" id="filesSection">
     <div class="sec-title">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
         Files (<?= $totalFiles ?>)
     </div>
+    <div id="noResults" class="empty-state" style="display:none"><span>🔍</span>No files match your search.</div>
     <?php foreach ($filesByDate as $dateCategory => $dateFiles): ?>
-    <div class="date-group">
+    <div class="date-group" id="dg-<?= h(preg_replace('/[^A-Za-z0-9]/','-',$dateCategory)) ?>">
         <div class="date-header">
             <div class="date-label">
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-                <?= h($dateCategory) ?> <span class="date-count"><?= count($dateFiles) ?></span>
+                <?= h($dateCategory) ?> <span class="date-count" id="cnt-<?= h(preg_replace('/[^A-Za-z0-9]/','-',$dateCategory)) ?>"><?= count($dateFiles) ?></span>
             </div>
             <div class="btn-group">
                 <a href="?download_zip=<?= urlencode($dateCategory) ?>" class="btn btn-green btn-sm">📦 ZIP</a>
-                <a href="?delete_day=<?= urlencode($dateCategory) ?>" class="btn btn-red btn-sm"
-                   onclick="return confirm('Delete all files from <?= h($dateCategory) ?>?')">🗑️ Delete Day</a>
+                <a href="?delete_day=<?= urlencode($dateCategory) ?>" class="btn btn-red btn-sm" onclick="return confirm('Delete all files from <?= h($dateCategory) ?>?')">🗑️ Delete Day</a>
             </div>
         </div>
-        <div class="files">
+        <div class="files" id="fg-<?= h(preg_replace('/[^A-Za-z0-9]/','-',$dateCategory)) ?>">
         <?php foreach ($dateFiles as $fd):
             $file     = $fd['name'];
             $filePath = $fd['path'];
             $isPerm   = $fd['permanent'];
+            $isFav    = $fd['fav'];
+            $fileFolder = $fd['folder'];
+            $dlCount  = $fd['downloads'];
             $ext      = strtolower(pathinfo($file, PATHINFO_EXTENSION));
             $fileSize = formatFileSize(filesize($filePath));
             $fileType = strtoupper($ext);
+            $hasShare = !empty($fileShares[$file]);
 
             $imgExts  = ['jpg','jpeg','png','gif','webp','bmp','svg'];
             $vidExts  = ['mp4','webm','ogg','mov','avi','mkv'];
@@ -1351,32 +1271,38 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
             $isTxt  = in_array($ext,$txtExts);
             $isZip  = in_array($ext,$zipExts);
 
+            // File type category for filtering
+            $typeClass = 'type-other';
+            if ($isImg) $typeClass = 'type-image';
+            elseif ($isVid) $typeClass = 'type-video';
+            elseif ($isAud) $typeClass = 'type-audio';
+            elseif ($isPdf || $isTxt) $typeClass = 'type-document';
+
             $icons=['pdf'=>'📄','doc'=>'📝','docx'=>'📝','xls'=>'📊','xlsx'=>'📊','ppt'=>'📽','pptx'=>'📽','zip'=>'📦','rar'=>'📦','7z'=>'📦','tar'=>'📦','gz'=>'📦','exe'=>'⚙️','apk'=>'📱','iso'=>'💿','txt'=>'📃','md'=>'📃','csv'=>'📊','json'=>'📋','xml'=>'📋','html'=>'🌐','css'=>'🎨','js'=>'⚡','php'=>'🐘','py'=>'🐍','sh'=>'🖥️'];
             $icon=$icons[$ext]??'📎';
         ?>
-        <div class="file-card">
+        <div class="file-card <?= $isFav?'is-fav':'' ?> <?= $typeClass ?>"
+             data-name="<?= h(strtolower($file)) ?>"
+             data-folder="<?= h($fileFolder) ?>"
+             data-fav="<?= $isFav?'1':'0' ?>">
             <!-- Delete -->
             <a href="?delete_file=<?= urlencode($file) ?>" class="card-del" onclick="return confirm('Delete <?= h(addslashes($file)) ?>?')">
                 <svg fill="currentColor" viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
             </a>
-            <!-- Countdown / Permanent badge — rendered by JS -->
-            <a href="?toggle_perm_file=<?= urlencode($file) ?>"
-               class="card-perm <?= $isPerm?'perm':'' ?>"
-               data-expires="<?= $isPerm ? '0' : ($fd['time'] + 72*60*60) ?>"
-               data-perm="<?= $isPerm?'1':'0' ?>"
-               title="Click to toggle permanent">
-                <?= $isPerm ? '🔒 Perm' : '' ?>
-            </a>
+            <!-- Favorite -->
+            <a href="?toggle_fav=<?= urlencode($file) ?>" class="card-fav <?= $isFav?'on':'' ?>" title="<?= $isFav?'Unstar':'Star this file' ?>">⭐</a>
+            <!-- Share -->
+            <button class="card-share <?= $hasShare?'has-share':'' ?>" onclick="openShareModal('<?= h(addslashes($file)) ?>')" title="Share link">🔗</button>
+            <!-- TTL Badge -->
+            <a href="?toggle_perm_file=<?= urlencode($file) ?>" class="card-perm <?= $isPerm?'perm':'' ?>" data-expires="<?= $isPerm ? '0' : ($fd['time'] + 72*60*60) ?>" data-perm="<?= $isPerm?'1':'0' ?>" title="Click to toggle permanent"><?= $isPerm ? '🔒 Perm' : '' ?></a>
 
-            <!-- Thumbnail / Preview -->
+            <!-- Thumbnail -->
             <div class="file-thumb" onclick="openPreview('<?= h(addslashes($file)) ?>','<?= $ext ?>','<?= h(addslashes($fileSize)) ?>')">
                 <?php if ($isImg): ?>
                     <img src="<?= h('uploads/'.$file) ?>" alt="<?= h($file) ?>" loading="lazy">
                     <div class="prev-overlay"><button class="prev-btn">👁 Preview</button></div>
                 <?php elseif ($isVid): ?>
-                    <video preload="metadata" muted>
-                        <source src="<?= h('uploads/'.$file) ?>" type="video/<?= h($ext) ?>">
-                    </video>
+                    <video preload="metadata" muted><source src="<?= h('uploads/'.$file) ?>" type="video/<?= h($ext) ?>"></video>
                     <div class="prev-overlay"><button class="prev-btn">▶ Play</button></div>
                 <?php elseif ($isPdf): ?>
                     <div class="file-icon-big">📄<span>PDF</span></div>
@@ -1404,9 +1330,19 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
                 <div class="file-meta-row">
                     <span class="fmtag"><?= h($fileType) ?></span>
                     <span><?= h($fileSize) ?></span>
+                    <?php if ($dlCount > 0): ?><span>⬇ <?= $dlCount ?></span><?php endif; ?>
+                    <?php if ($fileFolder): ?><span style="color:var(--accent2)">📂 <?= h($fileFolder) ?></span><?php endif; ?>
                 </div>
                 <div class="file-actions">
                     <a href="?download=<?= urlencode($file) ?>" class="file-dl-btn">⬇ Download</a>
+                    <?php if (!empty($folders)): ?>
+                    <select class="folder-select" style="flex:none;padding:5px 6px;font-size:10px;max-width:90px" onchange="moveFile('<?= h(addslashes($file)) ?>',this.value)" title="Move to folder">
+                        <option value="">📁</option>
+                        <?php foreach ($folders as $f): ?>
+                        <option value="<?= h($f) ?>" <?= $fileFolder===$f?'selected':'' ?>><?= h($f) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <?php endif; ?>
                 </div>
             </div>
         </div>
@@ -1415,11 +1351,13 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     </div>
     <?php endforeach; ?>
 </div>
+<?php else: ?>
+<div class="section"><div class="empty-state"><span>📂</span>No files uploaded yet. Drop something above!</div></div>
 <?php endif; ?>
 
 </div><!-- /container -->
 
-<!-- EDIT MODAL -->
+<!-- EDIT TEXT MODAL -->
 <div class="modal-overlay" id="editModal">
     <div class="modal-box" style="max-width:500px">
         <div class="modal-head">
@@ -1454,6 +1392,74 @@ if (!empty($_COOKIE['ft_theme']) && in_array($_COOKIE['ft_theme'], ['dark','ligh
     </div>
 </div>
 
+<!-- SHARE MODAL -->
+<div class="modal-overlay" id="shareModal">
+    <div class="modal-box share-modal-box">
+        <div class="modal-head">
+            <span class="modal-ttl">🔗 Share Link</span>
+            <button class="modal-close" onclick="closeShareModal()">×</button>
+        </div>
+        <div class="modal-body" style="display:block;overflow:visible;min-height:unset">
+            <div class="share-opt" id="shareOpt">
+                <div id="shareFileName" style="font-size:13px;color:var(--text2);font-weight:500"></div>
+                <!-- Expiry -->
+                <div class="share-row">
+                    <label>Expiry</label>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap">
+                        <span class="share-chip active" data-val="0" onclick="selectShareChip(this,'expiry')">♾ Permanent</span>
+                        <span class="share-chip" data-val="3600" onclick="selectShareChip(this,'expiry')">1 Hour</span>
+                        <span class="share-chip" data-val="86400" onclick="selectShareChip(this,'expiry')">1 Day</span>
+                        <span class="share-chip" data-val="604800" onclick="selectShareChip(this,'expiry')">7 Days</span>
+                    </div>
+                </div>
+                <!-- Download limit -->
+                <div class="share-row">
+                    <label>Max Downloads</label>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap">
+                        <span class="share-chip active" data-val="0" onclick="selectShareChip(this,'maxdl')">Unlimited</span>
+                        <span class="share-chip" data-val="1" onclick="selectShareChip(this,'maxdl')">1×</span>
+                        <span class="share-chip" data-val="5" onclick="selectShareChip(this,'maxdl')">5×</span>
+                        <span class="share-chip" data-val="10" onclick="selectShareChip(this,'maxdl')">10×</span>
+                    </div>
+                </div>
+                <!-- Password -->
+                <div class="share-row">
+                    <label>Password</label>
+                    <input type="password" id="sharePassword" placeholder="Optional — leave blank for none" style="flex:1">
+                </div>
+                <button class="btn btn-primary" style="width:100%;margin-top:0" onclick="createShareLink()">🔗 Generate Link</button>
+                <div id="shareResult" style="display:none">
+                    <div class="share-url-wrap">
+                        <div class="share-url-box" id="shareUrlBox"></div>
+                        <button class="btn btn-accent btn-sm" onclick="copyShareUrl()">Copy</button>
+                    </div>
+                    <div style="font-size:11px;color:var(--muted);margin-top:6px" id="shareInfo"></div>
+                </div>
+            </div>
+        </div>
+        <div class="modal-foot">
+            <button class="btn btn-ghost" style="width:auto" onclick="closeShareModal()">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- FOLDER MODAL -->
+<div class="modal-overlay" id="folderModal">
+    <div class="modal-box folder-modal-box">
+        <div class="modal-head">
+            <span class="modal-ttl">📁 New Folder</span>
+            <button class="modal-close" onclick="closeFolderModal()">×</button>
+        </div>
+        <div class="modal-body" style="display:block;min-height:unset">
+            <input type="text" id="folderNameInput" placeholder="Folder name…" style="width:100%" maxlength="40">
+        </div>
+        <div class="modal-foot">
+            <button class="btn btn-primary" style="width:auto" onclick="createFolder()">Create</button>
+            <button class="btn btn-ghost" style="width:auto" onclick="closeFolderModal()">Cancel</button>
+        </div>
+    </div>
+</div>
+
 <script>
 /* ====================================================
    CONSTANTS
@@ -1463,41 +1469,97 @@ const MAX_FILE_SIZE = 200 * 1024 * 1024;
 const MAX_PARALLEL = 3;
 
 /* ====================================================
-   THEME TOGGLE — init is in <head> inline script to prevent flash
+   TOAST NOTIFICATIONS
+==================================================== */
+function toast(msg, type='ok', dur=3200) {
+    const tc = document.getElementById('toastContainer');
+    const t = document.createElement('div');
+    t.className = 'toast '+type;
+    t.innerHTML = `<span class="toast-icon"></span><span>${msg}</span>`;
+    tc.appendChild(t);
+    setTimeout(()=>{ t.classList.add('out'); setTimeout(()=>t.remove(),300); }, dur);
+}
+
+/* ====================================================
+   THEME TOGGLE
 ==================================================== */
 function toggleTheme() {
-    const html    = document.documentElement;
-    const isLight = html.dataset.theme === 'light';
-    const next    = isLight ? 'dark' : 'light';
-    html.dataset.theme = next;
-    document.getElementById('themeToggle').textContent = isLight ? '🌙' : '☀️';
-    localStorage.setItem('ft_theme', next);
-    // Cookie ensures theme persists through server-side redirects (delete/upload)
-    document.cookie = 'ft_theme=' + next + ';path=/;max-age=31536000;samesite=Lax';
+    const html=document.documentElement, isLight=html.dataset.theme==='light', next=isLight?'dark':'light';
+    html.dataset.theme=next;
+    document.getElementById('themeToggle').textContent=isLight?'🌙':'☀️';
+    localStorage.setItem('ft_theme',next);
+    document.cookie='ft_theme='+next+';path=/;max-age=31536000;samesite=Lax';
 }
-// Sync button icon on load (theme already applied by head script)
 (function(){
-    const t = localStorage.getItem('ft_theme') ||
-        (document.cookie.match(/(?:^|;\s*)ft_theme=([^;]+)/)||[])[1] || 'dark';
-    const btn = document.getElementById('themeToggle');
-    if (btn) btn.textContent = (t==='light') ? '☀️' : '🌙';
+    const t=localStorage.getItem('ft_theme')||(document.cookie.match(/(?:^|;\s*)ft_theme=([^;]+)/)||[])[1]||'dark';
+    const btn=document.getElementById('themeToggle');
+    if(btn) btn.textContent=(t==='light')?'☀️':'🌙';
 })();
 
 /* ====================================================
-   KEEP-FOREVER TOGGLES
-   Both default ON (class "on" set in HTML)
+   AUTO DARK MODE (system preference)
 ==================================================== */
-let fileIsPermanent = false; // default OFF
+if(!localStorage.getItem('ft_theme')) {
+    const mq=window.matchMedia('(prefers-color-scheme: light)');
+    if(mq.matches){ document.documentElement.setAttribute('data-theme','light'); document.getElementById('themeToggle').textContent='☀️'; }
+    mq.addEventListener('change',e=>{
+        if(!localStorage.getItem('ft_theme_manual')) {
+            document.documentElement.setAttribute('data-theme',e.matches?'light':'dark');
+            document.getElementById('themeToggle').textContent=e.matches?'☀️':'🌙';
+        }
+    });
+}
 
+/* ====================================================
+   KEEP-FOREVER TOGGLES
+==================================================== */
+let fileIsPermanent = false;
 document.getElementById('filePermToggle').addEventListener('click', function(){
-    this.classList.toggle('on');
-    fileIsPermanent = this.classList.contains('on');
+    this.classList.toggle('on'); fileIsPermanent=this.classList.contains('on');
+});
+document.getElementById('textPermToggle').addEventListener('click', function(){
+    this.classList.toggle('on'); document.getElementById('textPermInput').value=this.classList.contains('on')?'1':'0';
 });
 
-document.getElementById('textPermToggle').addEventListener('click', function(){
-    this.classList.toggle('on');
-    document.getElementById('textPermInput').value = this.classList.contains('on') ? '1' : '0';
-});
+/* ====================================================
+   SEARCH & FILTER
+==================================================== */
+let currentFilter = 'all';
+let currentFolder = '__all__';
+
+function filterFiles() {
+    const q = document.getElementById('searchInput').value.toLowerCase().trim();
+    let visibleTotal = 0;
+    document.querySelectorAll('.file-card').forEach(card => {
+        const name = card.dataset.name || '';
+        const folder = card.dataset.folder || '';
+        const isFav = card.dataset.fav === '1';
+        let typeMatch = false;
+        if (currentFilter === 'all') typeMatch = true;
+        else if (currentFilter === 'fav') typeMatch = isFav;
+        else typeMatch = card.classList.contains('type-'+currentFilter);
+        const folderMatch = currentFolder === '__all__' || folder === currentFolder;
+        const searchMatch = q === '' || name.includes(q);
+        const visible = typeMatch && folderMatch && searchMatch;
+        card.style.display = visible ? '' : 'none';
+        if (visible) visibleTotal++;
+    });
+    // Show/hide date groups
+    document.querySelectorAll('.date-group').forEach(dg => {
+        const visible = Array.from(dg.querySelectorAll('.file-card')).some(c=>c.style.display!=='none');
+        dg.style.display = visible ? '' : 'none';
+    });
+    document.getElementById('noResults') && (document.getElementById('noResults').style.display = visibleTotal===0?'block':'none');
+}
+
+function setFilter(el, type) {
+    document.querySelectorAll('.fchip').forEach(c=>c.classList.remove('active'));
+    el.classList.add('active'); currentFilter = type; filterFiles();
+}
+function setFolderTab(el, folder) {
+    document.querySelectorAll('.ftab').forEach(t=>t.classList.remove('active'));
+    el.classList.add('active'); currentFolder = folder; filterFiles();
+}
 
 /* ====================================================
    DROP ZONE
@@ -1510,16 +1572,32 @@ fileInput.addEventListener('change', e => {
     const c = e.target.files.length;
     fileCount.textContent = c ? `📁 ${c} file(s) selected` : '';
 });
-['dragenter','dragover','dragleave','drop'].forEach(ev=>
-    dropZone.addEventListener(ev, e=>{e.preventDefault();e.stopPropagation();}));
+['dragenter','dragover','dragleave','drop'].forEach(ev=>dropZone.addEventListener(ev,e=>{e.preventDefault();e.stopPropagation();}));
 ['dragenter','dragover'].forEach(ev=>dropZone.addEventListener(ev,()=>dropZone.classList.add('dragover')));
 ['dragleave','drop'].forEach(ev=>dropZone.addEventListener(ev,()=>dropZone.classList.remove('dragover')));
 dropZone.addEventListener('click', ()=>fileInput.click());
 dropZone.addEventListener('drop', e=>{
-    const f = e.dataTransfer.files;
-    if (!f||!f.length) return;
-    fileInput.files = f;
-    fileCount.textContent = `📁 ${f.length} file(s) selected`;
+    const f=e.dataTransfer.files; if(!f||!f.length)return;
+    fileInput.files=f; fileCount.textContent=`📁 ${f.length} file(s) selected`;
+});
+
+/* ====================================================
+   PASTE UPLOAD (Ctrl+V screenshots)
+==================================================== */
+document.addEventListener('paste', async e => {
+    const items = [...(e.clipboardData?.items||[])];
+    const imgItem = items.find(i=>i.type.startsWith('image/'));
+    if (!imgItem) return;
+    e.preventDefault();
+    const blob = imgItem.getAsFile();
+    if (!blob) return;
+    const ts = new Date().toISOString().replace(/[:.]/g,'_').replace('T','_').slice(0,19);
+    const ext = blob.type.split('/')[1]||'png';
+    const named = new File([blob], `paste_${ts}.${ext}`, {type:blob.type});
+    const dt = new DataTransfer(); dt.items.add(named);
+    fileInput.files = dt.files;
+    fileCount.textContent = `📋 1 screenshot ready to upload`;
+    toast('Screenshot captured — click Upload to save', 'info');
 });
 
 /* ====================================================
@@ -1529,68 +1607,48 @@ document.getElementById('uploadForm').addEventListener('submit', async e => {
     e.preventDefault();
     const files = Array.from(fileInput.files);
     if (!files.length) return;
-
-    const btn        = document.getElementById('uploadBtn');
-    const pWrap      = document.getElementById('progressContainer');
-    const pFill      = document.getElementById('progressFill');
-    const pSpeed     = document.getElementById('uploadSpeed');
-    const pPct       = document.getElementById('progressPct');
-
-    btn.disabled = true;
-    pWrap.style.display = 'block';
-
-    const total = files.length;
-    let done = 0;
-    const prog = new Map();
-    const t0 = Date.now();
-
-    const update = () => {
-        let sum = 0; prog.forEach(p=>sum+=p);
-        const pct = Math.round((sum/total)*100);
-        pFill.style.width = pct+'%'; pPct.textContent = pct+'%';
-        const elapsed = (Date.now()-t0)/1000;
-        const spd = elapsed>0?(done/elapsed).toFixed(2):'0';
-        pSpeed.textContent = `⚡ ${done}/${total} · ${spd} files/sec`;
-    };
-
-    for (let i = 0; i < total; i += MAX_PARALLEL) {
-        const batch = files.slice(i, i+MAX_PARALLEL);
-        await Promise.all(batch.map(async (file, idx) => {
-            const g = i+idx; prog.set(g,0);
+    const btn=document.getElementById('uploadBtn');
+    const pWrap=document.getElementById('progressContainer');
+    const pFill=document.getElementById('progressFill');
+    const pSpeed=document.getElementById('uploadSpeed');
+    const pPct=document.getElementById('progressPct');
+    btn.disabled=true; pWrap.style.display='block';
+    const total=files.length; let done=0;
+    const prog=new Map(); const t0=Date.now();
+    const update=()=>{ let sum=0;prog.forEach(p=>sum+=p);const pct=Math.round((sum/total)*100);pFill.style.width=pct+'%';pPct.textContent=pct+'%';const elapsed=(Date.now()-t0)/1000;const spd=elapsed>0?(done/elapsed).toFixed(2):'0';pSpeed.textContent=`⚡ ${done}/${total} · ${spd} files/sec`; };
+    for (let i=0;i<total;i+=MAX_PARALLEL) {
+        const batch=files.slice(i,i+MAX_PARALLEL);
+        await Promise.all(batch.map(async(file,idx)=>{
+            const g=i+idx; prog.set(g,0);
             try {
-                if (file.size > MAX_FILE_SIZE) {
-                    alert(`"${file.name}" exceeds 200MB limit`);
-                    prog.set(g,1);
-                } else {
-                    await uploadChunked(file, p=>{ prog.set(g,p); update(); });
-                }
-                done++; update();
-            } catch(err) { console.error(err); alert(`Failed: "${file.name}"`); }
+                if(file.size>MAX_FILE_SIZE){ toast(`"${file.name}" exceeds 200MB limit`,'err'); prog.set(g,1); }
+                else { await uploadChunked(file,p=>{prog.set(g,p);update();}); }
+                done++;update();
+            } catch(err){console.error(err);toast(`Failed: "${file.name}"`,'err');}
         }));
     }
-    pSpeed.textContent = `✅ Done ${done}/${total}`;
-    pFill.style.width = '100%'; pPct.textContent = '100%';
-    setTimeout(()=>location.reload(), 900);
+    pSpeed.textContent=`✅ Done ${done}/${total}`;
+    pFill.style.width='100%'; pPct.textContent='100%';
+    toast(`Uploaded ${done}/${total} file(s)`,'ok');
+    setTimeout(()=>location.reload(),900);
 });
 
 /* ====================================================
-   CHUNKED UPLOAD — sends permanent flag
+   CHUNKED UPLOAD
 ==================================================== */
 async function uploadChunked(file, onProgress) {
-    const chunks = Math.ceil(file.size / CHUNK_SIZE);
-    const id = Date.now()+'_'+Math.random().toString(36).substr(2,9);
-    for (let i = 0; i < chunks; i++) {
-        const chunk = file.slice(i*CHUNK_SIZE, Math.min((i+1)*CHUNK_SIZE, file.size));
-        const fd = new FormData();
-        fd.append('file', chunk);
-        fd.append('chunk', i);
-        fd.append('totalChunks', chunks);
-        fd.append('fileName', file.name);
-        fd.append('uploadId', id);
-        fd.append('permanent', fileIsPermanent ? '1' : '0'); // [NEW]
-        const res = await fetch(location.pathname, {method:'POST', body:fd});
-        const r = await res.json();
-        if (!r.success) throw new Error('Chunk failed');
+    const chunks=Math.ceil(file.size/CHUNK_SIZE);
+    const id=Date.now()+'_'+Math.random().toString(36).substr(2,9);
+    const folder=document.getElementById('uploadFolderSelect')?.value||'';
+    for(let i=0;i<chunks;i++){
+        const chunk=file.slice(i*CHUNK_SIZE,Math.min((i+1)*CHUNK_SIZE,file.size));
+        const fd=new FormData();
+        fd.append('file',chunk); fd.append('chunk',i); fd.append('totalChunks',chunks);
+        fd.append('fileName',file.name); fd.append('uploadId',id);
+        fd.append('permanent',fileIsPermanent?'1':'0');
+        fd.append('folder',folder);
+        const res=await fetch(location.pathname,{method:'POST',body:fd});
+        const r=await res.json(); if(!r.success)throw new Error('Chunk failed');
         onProgress((i+1)/chunks);
     }
 }
@@ -1600,7 +1658,7 @@ async function uploadChunked(file, onProgress) {
 ==================================================== */
 document.getElementById('textForm').addEventListener('submit', e=>{
     e.preventDefault();
-    if (!document.getElementById('textArea').value.trim()) return;
+    if(!document.getElementById('textArea').value.trim())return;
     document.getElementById('textForm').submit();
 });
 
@@ -1608,276 +1666,238 @@ document.getElementById('textForm').addEventListener('submit', e=>{
    COPY TEXT
 ==================================================== */
 function copyText(btn, idx) {
-    const ta = document.getElementById('full-text-'+idx);
-    if (!ta) return;
-    (navigator.clipboard ? navigator.clipboard.writeText(ta.value) : Promise.resolve(
-        (ta.style.display='block', ta.select(), document.execCommand('copy'), ta.style.display='none')
-    )).then(()=>{}).catch(()=>{});
+    const ta=document.getElementById('full-text-'+idx); if(!ta)return;
+    (navigator.clipboard?navigator.clipboard.writeText(ta.value):Promise.resolve(
+        (ta.style.display='block',ta.select(),document.execCommand('copy'),ta.style.display='none')
+    )).then(()=>toast('Copied to clipboard','ok')).catch(()=>{});
     btn.classList.add('copied');
-    btn.innerHTML = '<svg fill="currentColor" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>';
-    setTimeout(()=>{
-        btn.classList.remove('copied');
-        btn.innerHTML = '<svg fill="currentColor" viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>';
-    }, 2000);
+    btn.innerHTML='<svg fill="currentColor" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>';
+    setTimeout(()=>{ btn.classList.remove('copied'); btn.innerHTML='<svg fill="currentColor" viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>'; },2000);
 }
 
 /* ====================================================
    EDIT MODAL
 ==================================================== */
 function openEditModal(idx) {
-    const ta = document.getElementById('full-text-'+idx);
-    document.getElementById('editTextArea').value = ta ? ta.value : '';
-    document.getElementById('editTextIndex').value = idx;
+    const ta=document.getElementById('full-text-'+idx);
+    document.getElementById('editTextArea').value=ta?ta.value:'';
+    document.getElementById('editTextIndex').value=idx;
     document.getElementById('editModal').classList.add('show');
 }
-function closeEditModal() { document.getElementById('editModal').classList.remove('show'); }
+function closeEditModal(){ document.getElementById('editModal').classList.remove('show'); }
 
 /* ====================================================
-   COUNTDOWN TIMERS — updates every minute
+   FOLDER MODAL
+==================================================== */
+function openFolderModal(){ document.getElementById('folderModal').classList.add('show'); setTimeout(()=>document.getElementById('folderNameInput').focus(),50); }
+function closeFolderModal(){ document.getElementById('folderModal').classList.remove('show'); }
+function createFolder(){
+    const name=document.getElementById('folderNameInput').value.trim();
+    if(!name)return;
+    location.href='?create_folder=1&name='+encodeURIComponent(name);
+}
+document.getElementById('folderNameInput').addEventListener('keydown',e=>{ if(e.key==='Enter')createFolder(); });
+
+/* ====================================================
+   MOVE FILE TO FOLDER
+==================================================== */
+function moveFile(file, folder) {
+    location.href='?move_file=1&file='+encodeURIComponent(file)+'&folder='+encodeURIComponent(folder);
+}
+
+/* ====================================================
+   SHARE MODAL
+==================================================== */
+let _shareFile = '';
+let _shareExpiry = 0;
+let _shareMaxDl = 0;
+
+function openShareModal(file) {
+    _shareFile=file; _shareExpiry=0; _shareMaxDl=0;
+    document.getElementById('shareFileName').textContent='📎 '+file;
+    document.getElementById('shareResult').style.display='none';
+    document.getElementById('sharePassword').value='';
+    // Reset chips
+    document.querySelectorAll('.share-chip').forEach(c=>{
+        c.classList.remove('active');
+        if(c.dataset.val==='0')c.classList.add('active');
+    });
+    document.getElementById('shareModal').classList.add('show');
+}
+function closeShareModal(){ document.getElementById('shareModal').classList.remove('show'); }
+
+function selectShareChip(el, group) {
+    el.closest('.share-row').querySelectorAll('.share-chip').forEach(c=>c.classList.remove('active'));
+    el.classList.add('active');
+    if(group==='expiry') _shareExpiry=parseInt(el.dataset.val);
+    else if(group==='maxdl') _shareMaxDl=parseInt(el.dataset.val);
+}
+
+async function createShareLink() {
+    const pw=document.getElementById('sharePassword').value;
+    const url=`?create_share=1&file=${encodeURIComponent(_shareFile)}&expires=${_shareExpiry}&max_dl=${_shareMaxDl}&password=${encodeURIComponent(pw)}`;
+    try {
+        const r=await fetch(url); const d=await r.json();
+        if(d.success){
+            document.getElementById('shareUrlBox').textContent=d.url;
+            document.getElementById('shareResult').style.display='block';
+            let info=''; 
+            if(_shareExpiry>0){const h=_shareExpiry/3600;info+=h<24?`Expires in ${h}h`:`Expires in ${h/24}d`;}
+            else info+='Never expires';
+            if(_shareMaxDl>0)info+=` · max ${_shareMaxDl} downloads`;
+            if(pw)info+=' · password protected';
+            document.getElementById('shareInfo').textContent=info;
+            toast('Share link created!','ok');
+        }
+    } catch(e){ toast('Failed to create link','err'); }
+}
+
+function copyShareUrl(){
+    const url=document.getElementById('shareUrlBox').textContent;
+    navigator.clipboard?.writeText(url).then(()=>toast('Link copied!','ok')).catch(()=>{});
+}
+
+/* ====================================================
+   COUNTDOWN TIMERS
 ==================================================== */
 function fmtCountdown(expiresTs) {
-    const now  = Math.floor(Date.now()/1000);
-    const diff = expiresTs - now;
-    if (diff <= 0) return {text:'Expired', cls:'soon'};
-    const h = Math.floor(diff/3600);
-    const m = Math.floor((diff%3600)/60);
-    if (h >= 48) return {text:`~${Math.ceil(diff/86400)}d`, cls:'ok'};
-    if (h >= 6)  return {text:`${h}h ${m}m`, cls:'ok'};
-    if (h >= 1)  return {text:`${h}h ${m}m`, cls:'mid'};
-    return {text:`${m}m`, cls:'soon'};
+    const now=Math.floor(Date.now()/1000), diff=expiresTs-now;
+    if(diff<=0)return{text:'Expired',cls:'soon'};
+    const h=Math.floor(diff/3600),m=Math.floor((diff%3600)/60);
+    if(h>=48)return{text:`~${Math.ceil(diff/86400)}d`,cls:'ok'};
+    if(h>=6)return{text:`${h}h ${m}m`,cls:'ok'};
+    if(h>=1)return{text:`${h}h ${m}m`,cls:'mid'};
+    return{text:`${m}m`,cls:'soon'};
 }
-
 function updateCountdowns() {
-    // TTL badges in text cards
-    document.querySelectorAll('.ttl-badge[data-expires]').forEach(el => {
-        if (el.dataset.perm === '1') return; // already showing 🔒 Perm
-        const exp = parseInt(el.dataset.expires, 10);
-        if (!exp) return;
-        const {text, cls} = fmtCountdown(exp);
-        el.className = 'ttl-badge ' + cls;
-        el.textContent = '⏱ ' + text;
+    document.querySelectorAll('.ttl-badge[data-expires]').forEach(el=>{
+        if(el.dataset.perm==='1')return;
+        const exp=parseInt(el.dataset.expires,10); if(!exp)return;
+        const{text,cls}=fmtCountdown(exp); el.className='ttl-badge '+cls; el.textContent='⏱ '+text;
     });
-    // Countdown badges on file cards
-    document.querySelectorAll('.card-perm[data-expires]').forEach(el => {
-        if (el.dataset.perm === '1') return;
-        const exp = parseInt(el.dataset.expires, 10);
-        if (!exp) return;
-        const {text, cls} = fmtCountdown(exp);
-        el.className = 'card-perm ' + cls;
-        el.textContent = '⏱ ' + text;
+    document.querySelectorAll('.card-perm[data-expires]').forEach(el=>{
+        if(el.dataset.perm==='1')return;
+        const exp=parseInt(el.dataset.expires,10); if(!exp)return;
+        const{text,cls}=fmtCountdown(exp); el.className='card-perm '+cls; el.textContent='⏱ '+text;
     });
 }
-updateCountdowns();
-setInterval(updateCountdowns, 60000);
+updateCountdowns(); setInterval(updateCountdowns,60000);
 
 /* ====================================================
-   FILE PREVIEW MODAL — with image zoom & video seek
+   FILE PREVIEW MODAL
 ==================================================== */
-const _imgs = ['jpg','jpeg','png','gif','webp','bmp','svg'];
-const _vids = ['mp4','webm','ogg','mov','avi','mkv'];
-const _auds = ['mp3','wav','ogg','aac','flac','m4a','opus'];
-const _txts = ['txt','md','csv','json','xml','html','css','js','php','py','sh','log'];
+const _imgs=['jpg','jpeg','png','gif','webp','bmp','svg'];
+const _vids=['mp4','webm','ogg','mov','avi','mkv'];
+const _auds=['mp3','wav','ogg','aac','flac','m4a','opus'];
+const _txts=['txt','md','csv','json','xml','html','css','js','php','py','sh','log'];
 
-function openPreview(file, ext, size) {
-    const modal = document.getElementById('previewModal');
-    const body  = document.getElementById('previewBody');
-    const url   = 'uploads/' + encodeURIComponent(file);
-    document.getElementById('previewTitle').textContent = file;
-    document.getElementById('previewDl').href = '?download=' + encodeURIComponent(file);
-    body.innerHTML = '';
-
-    if (_imgs.includes(ext)) {
-        // ---- IMAGE VIEWER WITH ZOOM ----
-        let scale = 1, startX = 0, startY = 0, tx = 0, ty = 0, isDragging = false;
-        const MIN_SCALE = 0.5, MAX_SCALE = 8;
-
-        body.innerHTML = `
-        <div class="img-viewer">
-            <div class="img-viewer-wrap" id="imgWrap">
-                <img id="zoomImg" src="${_esc(url)}" alt="${_esc(file)}">
-            </div>
-            <div class="img-controls">
-                <button class="img-ctrl-btn" id="zoomOut" title="Zoom out">−</button>
-                <span class="img-zoom-label" id="zoomPct">100%</span>
-                <button class="img-ctrl-btn" id="zoomIn" title="Zoom in">+</button>
-                <button class="img-ctrl-btn" id="zoomReset" title="Reset" style="font-size:12px">↺</button>
-                <button class="img-ctrl-btn" id="rotateBtn" title="Rotate">⟳</button>
-            </div>
-        </div>`;
-
-        const wrap = document.getElementById('imgWrap');
-        const img  = document.getElementById('zoomImg');
-        let rot = 0;
-
-        function applyTransform() {
-            img.style.transform = `translate(${tx}px,${ty}px) scale(${scale}) rotate(${rot}deg)`;
-            document.getElementById('zoomPct').textContent = Math.round(scale*100)+'%';
-        }
-
-        document.getElementById('zoomIn').onclick    = ()=>{ scale=Math.min(MAX_SCALE,scale+0.25); tx=0;ty=0; applyTransform(); };
-        document.getElementById('zoomOut').onclick   = ()=>{ scale=Math.max(MIN_SCALE,scale-0.25); tx=0;ty=0; applyTransform(); };
-        document.getElementById('zoomReset').onclick = ()=>{ scale=1; tx=0; ty=0; rot=0; applyTransform(); };
-        document.getElementById('rotateBtn').onclick = ()=>{ rot=(rot+90)%360; applyTransform(); };
-
-        // Mouse wheel zoom
-        wrap.addEventListener('wheel', e=>{
-            e.preventDefault();
-            scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale + (e.deltaY<0?0.15:-0.15)));
-            applyTransform();
-        }, {passive:false});
-
-        // Drag to pan when zoomed
-        wrap.addEventListener('mousedown', e=>{ if(scale<=1)return; isDragging=true; startX=e.clientX-tx; startY=e.clientY-ty; });
-        window.addEventListener('mousemove', e=>{ if(!isDragging)return; tx=e.clientX-startX; ty=e.clientY-startY; applyTransform(); });
-        window.addEventListener('mouseup', ()=>{ isDragging=false; });
-
-        // Pinch zoom (touch)
-        let lastDist = 0;
-        wrap.addEventListener('touchstart', e=>{ if(e.touches.length===2) lastDist=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY); });
-        wrap.addEventListener('touchmove', e=>{
-            if(e.touches.length===2){
-                e.preventDefault();
-                const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
-                scale=Math.min(MAX_SCALE,Math.max(MIN_SCALE,scale*(d/lastDist)));
-                lastDist=d; applyTransform();
-            }
-        },{passive:false});
-
-    } else if (_vids.includes(ext)) {
-        // ---- VIDEO PLAYER WITH SEEK CONTROLS ----
-        body.innerHTML = `
-        <div style="width:100%;display:flex;flex-direction:column;gap:8px">
-            <div class="vid-wrap">
-                <video id="previewVid" controls style="width:100%;max-height:60vh;display:block">
-                    <source src="${_esc(url)}" type="video/${ext}">
-                </video>
-            </div>
-            <div class="vid-seek-bar">
-                <button class="seek-btn" onclick="seekVid(-10)">⏪ 10s</button>
-                <button class="seek-btn" onclick="seekVid(-5)">◀ 5s</button>
-                <span class="vid-time-lbl" id="vidTimeLbl">0:00 / 0:00</span>
-                <button class="seek-btn" onclick="seekVid(5)">5s ▶</button>
-                <button class="seek-btn" onclick="seekVid(10)">10s ⏩</button>
-            </div>
-        </div>`;
-
-        const vid = document.getElementById('previewVid');
-        function updateTime(){
-            const fmt=t=>{const m=Math.floor(t/60),s=Math.floor(t%60);return m+':'+(s<10?'0':'')+s};
-            const lbl=document.getElementById('vidTimeLbl');
-            if(lbl) lbl.textContent=fmt(vid.currentTime)+' / '+fmt(vid.duration||0);
-        }
-        vid.addEventListener('timeupdate', updateTime);
-        vid.addEventListener('loadedmetadata', updateTime);
-
-    } else if (ext==='pdf') {
-        body.innerHTML = `<iframe src="${_esc(url)}#toolbar=1" style="width:100%;height:65vh;border:none;border-radius:8px"></iframe>`;
-
-    } else if (_auds.includes(ext)) {
-        body.innerHTML = `<div style="width:100%;text-align:center;padding:30px 0">
-            <div style="font-size:60px;margin-bottom:14px">🎵</div>
-            <p style="color:var(--text);font-size:14px;font-weight:600;margin-bottom:4px">${_esc(file)}</p>
-            <p style="color:var(--muted);font-size:11px;margin-bottom:16px">${_esc(size)}</p>
-            <audio controls autoplay style="width:100%"><source src="${_esc(url)}"></audio>
-        </div>`;
-
-    } else if (_txts.includes(ext)) {
-        body.innerHTML = '<div class="url-loader"><div class="spinner"></div> Loading…</div>';
-        fetch(url).then(r=>r.text()).then(txt=>{
-            const pre = document.createElement('pre');
-            pre.textContent = txt.length>60000 ? txt.substr(0,60000)+'\n…(truncated)' : txt;
-            body.innerHTML=''; body.appendChild(pre);
-        }).catch(()=>{ body.innerHTML='<p style="color:var(--red);padding:20px">Could not load.</p>'; });
-
-    } else {
-        body.innerHTML = `<div style="text-align:center;padding:40px">
-            <div style="font-size:68px;margin-bottom:14px">📎</div>
-            <p style="color:var(--text2);font-size:13px">${_esc(file)}</p>
-            <p style="color:var(--muted);font-size:11px;margin-top:5px">${_esc(size)}</p></div>`;
-    }
-    modal.classList.add('show');
-}
-
-// Video seek helper — called by seek buttons
-function seekVid(secs) {
-    const v = document.getElementById('previewVid');
-    if (!v) return;
-    v.currentTime = Math.max(0, Math.min(v.duration||0, v.currentTime + secs));
-}
-
-function closePreview() {
-    const m = document.getElementById('previewModal');
-    m.classList.remove('show');
-    // Stop any playing media
-    m.querySelectorAll('video,audio').forEach(el=>{try{el.pause();el.src='';}catch{}});
-    document.getElementById('previewBody').innerHTML='';
-}
-
-/* ====================================================
-   URL PREVIEW — fetch OpenGraph metadata & render card
-==================================================== */
 function _esc(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function _isUrl(s){try{const u=new URL(s.trim());return u.protocol==='http:'||u.protocol==='https:';}catch{return false;}}
 
-function renderUrlPreview(el, meta, rawUrl) {
-    let domain = meta.domain || '';
-    if (!domain) { try { domain = new URL(rawUrl||meta.url||'').hostname; } catch{} }
-    const dispDomain = domain.replace(/^www\./, '');
+function openPreview(file,ext,size){
+    const modal=document.getElementById('previewModal');
+    const body=document.getElementById('previewBody');
+    const url='uploads/'+encodeURIComponent(file);
+    document.getElementById('previewTitle').textContent=file;
+    document.getElementById('previewDl').href='?download='+encodeURIComponent(file);
+    body.innerHTML='';
 
-    const fav = meta.favicon
-        ? `<img src="${_esc(meta.favicon)}" onerror="this.style.display='none'" alt="" style="width:14px;height:14px;border-radius:3px;flex-shrink:0">`
-        : '<span style="font-size:13px">🌐</span>';
-
-    // Only show image if it's a real absolute URL (avoids broken data: or relative)
-    const showImg = meta.image && /^https?:\/\//i.test(meta.image);
-    const imgHtml = showImg
-        ? `<img style="width:100%;height:110px;object-fit:cover;display:block;border-radius:6px 6px 0 0" src="${_esc(meta.image)}" alt="" onerror="this.remove()" loading="lazy">`
-        : '';
-
-    const displayTitle = meta.title || dispDomain || rawUrl || '';
-
-    el.innerHTML = `
-        <a class="url-preview-card" href="${_esc(rawUrl||meta.url)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">
-            ${imgHtml}
-            <div class="url-pbody">
-                <div class="url-pdomain">${fav} <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_esc(dispDomain)}</span></div>
-                ${displayTitle ? `<div class="url-ptitle">${_esc(displayTitle)}</div>` : ''}
-                ${meta.description ? `<div class="url-pdesc">${_esc(meta.description)}</div>` : ''}
-            </div>
-        </a>`;
+    if(_imgs.includes(ext)){
+        let scale=1,startX=0,startY=0,tx=0,ty=0,isDragging=false,rot=0;
+        const MIN_SCALE=0.5,MAX_SCALE=8;
+        body.innerHTML=`<div class="img-viewer"><div class="img-viewer-wrap" id="imgWrap"><img id="zoomImg" src="${_esc(url)}" alt="${_esc(file)}"></div><div class="img-controls"><button class="img-ctrl-btn" id="zoomOut">−</button><span class="img-zoom-label" id="zoomPct">100%</span><button class="img-ctrl-btn" id="zoomIn">+</button><button class="img-ctrl-btn" id="zoomReset" style="font-size:12px">↺</button><button class="img-ctrl-btn" id="rotateBtn">⟳</button></div></div>`;
+        const wrap=document.getElementById('imgWrap'),img=document.getElementById('zoomImg');
+        function applyTransform(){img.style.transform=`translate(${tx}px,${ty}px) scale(${scale}) rotate(${rot}deg)`;document.getElementById('zoomPct').textContent=Math.round(scale*100)+'%';}
+        document.getElementById('zoomIn').onclick=()=>{scale=Math.min(MAX_SCALE,scale+0.25);tx=0;ty=0;applyTransform();};
+        document.getElementById('zoomOut').onclick=()=>{scale=Math.max(MIN_SCALE,scale-0.25);tx=0;ty=0;applyTransform();};
+        document.getElementById('zoomReset').onclick=()=>{scale=1;tx=0;ty=0;rot=0;applyTransform();};
+        document.getElementById('rotateBtn').onclick=()=>{rot=(rot+90)%360;applyTransform();};
+        wrap.addEventListener('wheel',e=>{e.preventDefault();scale=Math.min(MAX_SCALE,Math.max(MIN_SCALE,scale+(e.deltaY<0?0.15:-0.15)));applyTransform();},{passive:false});
+        wrap.addEventListener('mousedown',e=>{if(scale<=1)return;isDragging=true;startX=e.clientX-tx;startY=e.clientY-ty;});
+        window.addEventListener('mousemove',e=>{if(!isDragging)return;tx=e.clientX-startX;ty=e.clientY-startY;applyTransform();});
+        window.addEventListener('mouseup',()=>{isDragging=false;});
+        let lastDist=0;
+        wrap.addEventListener('touchstart',e=>{if(e.touches.length===2)lastDist=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);});
+        wrap.addEventListener('touchmove',e=>{if(e.touches.length===2){e.preventDefault();const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);scale=Math.min(MAX_SCALE,Math.max(MIN_SCALE,scale*(d/lastDist)));lastDist=d;applyTransform();}},{passive:false});
+    } else if(_vids.includes(ext)){
+        body.innerHTML=`<div style="width:100%;display:flex;flex-direction:column;gap:8px"><div class="vid-wrap"><video id="previewVid" controls style="width:100%;max-height:60vh;display:block"><source src="${_esc(url)}" type="video/${ext}"></video></div><div class="vid-seek-bar"><button class="seek-btn" onclick="seekVid(-10)">⏪ 10s</button><button class="seek-btn" onclick="seekVid(-5)">◀ 5s</button><span class="vid-time-lbl" id="vidTimeLbl">0:00 / 0:00</span><button class="seek-btn" onclick="seekVid(5)">5s ▶</button><button class="seek-btn" onclick="seekVid(10)">10s ⏩</button></div></div>`;
+        const vid=document.getElementById('previewVid');
+        function updateTime(){const fmt=t=>{const m=Math.floor(t/60),s=Math.floor(t%60);return m+':'+(s<10?'0':'')+s};const lbl=document.getElementById('vidTimeLbl');if(lbl)lbl.textContent=fmt(vid.currentTime)+' / '+fmt(vid.duration||0);}
+        vid.addEventListener('timeupdate',updateTime); vid.addEventListener('loadedmetadata',updateTime);
+    } else if(ext==='pdf'){
+        body.innerHTML=`<iframe src="${_esc(url)}#toolbar=1" style="width:100%;height:65vh;border:none;border-radius:8px"></iframe>`;
+    } else if(_auds.includes(ext)){
+        body.innerHTML=`<div style="width:100%;text-align:center;padding:30px 0"><div style="font-size:60px;margin-bottom:14px">🎵</div><p style="color:var(--text);font-size:14px;font-weight:600;margin-bottom:4px">${_esc(file)}</p><p style="color:var(--muted);font-size:11px;margin-bottom:16px">${_esc(size)}</p><audio controls autoplay style="width:100%"><source src="${_esc(url)}"></audio></div>`;
+    } else if(_txts.includes(ext)){
+        body.innerHTML='<div class="url-loader"><div class="spinner"></div> Loading…</div>';
+        fetch(url).then(r=>r.text()).then(txt=>{const pre=document.createElement('pre');pre.textContent=txt.length>60000?txt.substr(0,60000)+'\n…(truncated)':txt;body.innerHTML='';body.appendChild(pre);}).catch(()=>{body.innerHTML='<p style="color:var(--red);padding:20px">Could not load.</p>';});
+    } else {
+        body.innerHTML=`<div style="text-align:center;padding:40px"><div style="font-size:68px;margin-bottom:14px">📎</div><p style="color:var(--text2);font-size:13px">${_esc(file)}</p><p style="color:var(--muted);font-size:11px;margin-top:5px">${_esc(size)}</p></div>`;
+    }
+    modal.classList.add('show');
 }
+function seekVid(secs){const v=document.getElementById('previewVid');if(!v)return;v.currentTime=Math.max(0,Math.min(v.duration||0,v.currentTime+secs));}
+function closePreview(){const m=document.getElementById('previewModal');m.classList.remove('show');m.querySelectorAll('video,audio').forEach(el=>{try{el.pause();el.src='';}catch{}});document.getElementById('previewBody').innerHTML='';}
 
-// Staggered URL preview fetch
-const _previewWraps = document.querySelectorAll('.url-preview-wrap[data-url]');
-_previewWraps.forEach((wrap, i) => {
-    const url = wrap.dataset.url;
-    if (!_isUrl(url)) { wrap.innerHTML=''; return; }
-    setTimeout(async () => {
-        try {
-            const res  = await fetch(`?fetch_meta&url=${encodeURIComponent(url)}`);
-            if (!res.ok) throw new Error('HTTP '+res.status);
-            const meta = await res.json();
-            renderUrlPreview(wrap, meta, url);
-        } catch {
-            let dom = ''; try { dom = new URL(url).hostname.replace(/^www\./,''); } catch{}
-            wrap.innerHTML = `<a class="url-preview-card" href="${_esc(url)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">
-                <div class="url-pbody">
-                    <div class="url-pdomain"><span style="font-size:13px">🔗</span> <span>${_esc(dom||'Link')}</span></div>
-                    <div class="url-ptitle" style="color:var(--text2);font-weight:400;font-size:11px;word-break:break-all">${_esc(url.length>80?url.substr(0,80)+'…':url)}</div>
-                </div></a>`;
-        }
-    }, i * 150);
+/* ====================================================
+   URL PREVIEW
+==================================================== */
+function renderUrlPreview(el,meta,rawUrl){
+    let domain=meta.domain||''; if(!domain){try{domain=new URL(rawUrl||meta.url||'').hostname;}catch{}}
+    const dispDomain=domain.replace(/^www\./,'');
+    const fav=meta.favicon?`<img src="${_esc(meta.favicon)}" onerror="this.style.display='none'" alt="" style="width:14px;height:14px;border-radius:3px;flex-shrink:0">`:'<span style="font-size:13px">🌐</span>';
+    const showImg=meta.image&&/^https?:\/\//i.test(meta.image);
+    const imgHtml=showImg?`<img style="width:100%;height:110px;object-fit:cover;display:block;border-radius:6px 6px 0 0" src="${_esc(meta.image)}" alt="" onerror="this.remove()" loading="lazy">`:'';
+    const displayTitle=meta.title||dispDomain||rawUrl||'';
+    el.innerHTML=`<a class="url-preview-card" href="${_esc(rawUrl||meta.url)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">${imgHtml}<div class="url-pbody"><div class="url-pdomain">${fav} <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_esc(dispDomain)}</span></div>${displayTitle?`<div class="url-ptitle">${_esc(displayTitle)}</div>`:''}${meta.description?`<div class="url-pdesc">${_esc(meta.description)}</div>`:''}</div></a>`;
+}
+const _previewWraps=document.querySelectorAll('.url-preview-wrap[data-url]');
+_previewWraps.forEach((wrap,i)=>{
+    const url=wrap.dataset.url; if(!_isUrl(url)){wrap.innerHTML='';return;}
+    setTimeout(async()=>{
+        try{const res=await fetch(`?fetch_meta&url=${encodeURIComponent(url)}`);if(!res.ok)throw new Error('HTTP '+res.status);const meta=await res.json();renderUrlPreview(wrap,meta,url);}
+        catch{let dom='';try{dom=new URL(url).hostname.replace(/^www\./,'');}catch{}wrap.innerHTML=`<a class="url-preview-card" href="${_esc(url)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()"><div class="url-pbody"><div class="url-pdomain"><span style="font-size:13px">🔗</span> <span>${_esc(dom||'Link')}</span></div><div class="url-ptitle" style="color:var(--text2);font-weight:400;font-size:11px;word-break:break-all">${_esc(url.length>80?url.substr(0,80)+'…':url)}</div></div></a>`;}
+    },i*150);
 });
 
 /* ====================================================
-   CLOSE MODALS ON OVERLAY CLICK / ESCAPE
+   CLOSE MODALS ON OVERLAY / ESCAPE
 ==================================================== */
-document.querySelectorAll('.modal-overlay').forEach(m => {
-    m.addEventListener('click', e => {
-        if (e.target === m) { closeEditModal(); closePreview(); }
-    });
+document.querySelectorAll('.modal-overlay').forEach(m=>{
+    m.addEventListener('click',e=>{ if(e.target===m){closeEditModal();closePreview();closeShareModal();closeFolderModal();} });
 });
-document.addEventListener('keydown', e => { if(e.key==='Escape'){closeEditModal();closePreview();} });
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeEditModal();closePreview();closeShareModal();closeFolderModal();}});
+
+/* ====================================================
+   PWA INSTALL BANNER
+==================================================== */
+let _deferredInstall=null;
+window.addEventListener('beforeinstallprompt',e=>{
+    e.preventDefault(); _deferredInstall=e;
+    const banner=document.createElement('div');
+    banner.id='installBanner';
+    banner.style.cssText='position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:var(--bg2);border:1px solid rgba(124,106,255,.3);border-radius:12px;padding:12px 18px;display:flex;align-items:center;gap:12px;box-shadow:0 8px 24px rgba(0,0,0,.4);z-index:9000;font-size:13px;color:var(--text)';
+    banner.innerHTML='<span style="font-size:20px">📱</span><span>Install Fast Transfer as an app?</span><button onclick="installPWA()" style="padding:6px 14px;border-radius:7px;background:var(--accent-g);color:#fff;border:none;font-size:12px;font-weight:700;cursor:pointer">Install</button><button onclick="this.parentElement.remove()" style="padding:6px 10px;border-radius:7px;background:var(--card);color:var(--text2);border:1px solid var(--border2);font-size:12px;cursor:pointer">Later</button>';
+    document.body.appendChild(banner);
+    setTimeout(()=>banner?.remove(),12000);
+});
+function installPWA(){if(_deferredInstall){_deferredInstall.prompt();_deferredInstall.userChoice.then(()=>{_deferredInstall=null;document.getElementById('installBanner')?.remove();});}}
+
+/* ====================================================
+   SERVICE WORKER (PWA offline support)
+==================================================== */
+if('serviceWorker' in navigator){
+    const swCode=`
+self.addEventListener('install',e=>self.skipWaiting());
+self.addEventListener('activate',e=>clients.claim());
+self.addEventListener('fetch',e=>{
+    if(e.request.method!=='GET')return;
+    e.respondWith(fetch(e.request).catch(()=>new Response('<h2>Offline</h2><p>Fast Transfer is offline.</p>',{headers:{'Content-Type':'text/html'}})));
+});`;
+    const blob=new Blob([swCode],{type:'application/javascript'});
+    const swUrl=URL.createObjectURL(blob);
+    navigator.serviceWorker.register(swUrl).catch(()=>{});
+}
 </script>
 </body>
 </html>
