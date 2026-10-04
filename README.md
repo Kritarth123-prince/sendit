@@ -159,4 +159,12 @@ Do not upload `tests/`, `docs/`, your local `.env` or the contents of your local
 
 ## Licence
 
-_To be confirmed._ Copyright © 2026 MTS. Until a licence file is added, all rights are reserved.
+FastTransfer is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
+
+Copyright © 2026 MTS.
+
+You are free to use, copy, modify, and redistribute FastTransfer under the terms of the GNU AGPL v3.0.
+
+If you modify FastTransfer and make the modified version available for users to interact with over a network, the GNU AGPL v3.0 requires you to make the corresponding source code of that modified version available to those users, subject to the terms of the licence.
+
+The complete licence terms are available in the [`LICENSE`](LICENSE) file.
