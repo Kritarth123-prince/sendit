@@ -1,0 +1,91 @@
+/* Notepad (assets/js/views/notepad.js), loaded on demand. Design tokens only (assets/css/app.css),
+   so every accent palette and both themes apply. Two panes on wide screens; below 900 px (the
+   shell's phone layout) the list and the editor are separate screens (data-pane). */
+.np{display:grid;grid-template-columns:288px minmax(0,1fr);gap:18px;height:calc(100vh - var(--topbar-h) - 62px);height:calc(100dvh - var(--topbar-h) - 62px);min-height:440px}
+
+/* ---------- list ---------- */
+.np-list{display:flex;flex-direction:column;min-height:0;background:var(--card);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+.np-list-head{display:flex;align-items:flex-start;gap:10px;padding:18px 16px 12px;border-bottom:1px solid var(--border)}
+.np-list-head .view-sub{margin-top:2px}
+.np-items{flex:1;overflow-y:auto;padding:8px;overscroll-behavior:contain}
+.np-group{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding:12px 10px 6px}
+.np-item{display:flex;align-items:center;gap:10px;padding:10px;border-radius:var(--rsm);color:var(--text);text-decoration:none;transition:background var(--tr),box-shadow var(--tr)}
+.np-item:hover{background:var(--card-hov);text-decoration:none}
+.np-item.on{background:var(--accent-a12);box-shadow:inset 0 0 0 1px var(--accent-a30)}
+.np-item-ico{width:32px;height:32px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;flex:none;background:var(--bg3);color:var(--text2)}
+.np-item.on .np-item-ico{background:var(--accent-g);color:var(--on-accent);box-shadow:var(--accent-shadow)}
+.np-item-main{display:flex;flex-direction:column;min-width:0;flex:1}
+.np-item-title{font-weight:600;font-size:14px;line-height:1.3}
+.np-item-meta{font-size:12px;color:var(--muted);line-height:1.35}
+.np-here{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:700;color:var(--text2);flex:none}
+.np-dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px var(--green-a12)}
+
+/* ---------- editor ---------- */
+.np-editor{display:flex;flex-direction:column;min-width:0;min-height:0}
+.np-head{display:flex;align-items:center;gap:6px;padding:0 2px 12px}
+.np-back{display:none}
+.np-head-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.np-head-main .row{gap:10px;min-width:0}
+.np-title{font-family:var(--font-head);font-size:21px;font-weight:800;letter-spacing:-.01em;min-width:0}
+.np-vis{display:inline-flex;align-items:center;gap:5px;flex:none;padding:3px 9px;border-radius:999px;font-size:11.5px;font-weight:700;border:1px solid var(--border2);color:var(--text2)}
+.np-vis.team{color:var(--accent-text);border-color:var(--accent-a30);background:var(--accent-a12)}
+.np-sub{min-height:26px;display:flex;align-items:center}
+.np-presence{display:flex;align-items:center;gap:0}
+.np-presence .avatar{margin-left:-6px;border:2px solid var(--bg);box-shadow:0 0 0 1px var(--accent-a30)}
+.np-presence .avatar:first-child{margin-left:0}
+.np-presence-text{margin-left:8px;font-size:12.5px;color:var(--text2)}
+.np-status{display:inline-flex;align-items:center;gap:6px;flex:none;padding:5px 10px;border-radius:999px;font-size:12px;font-weight:600;color:var(--muted);background:var(--card);border:1px solid var(--border);white-space:nowrap;margin-right:4px;transition:color var(--tr),background var(--tr)}
+.np-status.saved .ico{color:var(--green)}
+.np-status.saving .ico{animation:np-spin 1s linear infinite}
+.np-status.merged{color:var(--accent-text);border-color:var(--accent-a30);background:var(--accent-a12)}
+.np-status.offline,.np-status.error{color:var(--yellow);border-color:transparent;background:var(--yellow-a12)}
+.np-status.error{color:var(--red);background:var(--red-a12)}
+@keyframes np-spin{to{transform:rotate(360deg)}}
+
+/* The writing surface: a soft "paper" card with generous measure and line height. */
+.np-paper{flex:1;min-height:0;display:flex;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden;transition:border-color var(--tr),box-shadow var(--tr)}
+.np-paper:focus-within{border-color:var(--accent-a30);box-shadow:var(--shadow),0 0 0 3px var(--accent-a12)}
+.np-text{flex:1;width:100%;min-height:0;resize:none;border:0;outline:none;background:transparent;color:var(--text);padding:26px clamp(18px,4vw,48px);font-size:15.5px;line-height:1.75;letter-spacing:.005em;tab-size:4;overflow-y:auto;overscroll-behavior:contain}
+.np-text::placeholder{color:var(--muted)}
+.np-text.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;line-height:1.65}
+.np-foot{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 4px 0;font-size:12px;color:var(--muted)}
+.np-size.warn{color:var(--yellow);font-weight:600}
+.np-loading{padding-top:6px}
+
+/* ---------- dialogs ---------- */
+.np-choices{display:grid;gap:8px}
+.np-choice{display:flex;align-items:flex-start;gap:12px;padding:12px;border:1px solid var(--border2);border-radius:var(--rsm);cursor:pointer;transition:border-color var(--tr),background var(--tr)}
+.np-choice:hover{background:var(--card-hov)}
+.np-choice:has(input:checked){border-color:var(--accent);background:var(--accent-a12)}
+.np-choice input{margin-top:3px;accent-color:var(--accent)}
+.np-choice>span:last-child{display:flex;flex-direction:column;gap:2px}
+.np-choice-ico{width:30px;height:30px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;flex:none;background:var(--bg3);color:var(--accent-text)}
+.np-revs{display:flex;flex-direction:column;gap:4px;max-height:60vh;overflow-y:auto}
+.np-rev{display:flex;align-items:center;gap:12px;width:100%;padding:10px 12px;border-radius:var(--rsm);text-align:left;transition:background var(--tr)}
+.np-rev:hover{background:var(--card-hov)}
+.np-rev-time{font-variant-numeric:tabular-nums;font-weight:700;min-width:44px;color:var(--accent-text)}
+.np-rev-main{flex:1;min-width:0;display:flex;flex-direction:column}
+.np-preview{max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-word;background:var(--bg3);border:1px solid var(--border);border-radius:var(--rsm);padding:16px;font-size:13.5px;line-height:1.6}
+
+/* ---------- phones and narrow windows ---------- */
+@media (max-width:899px){
+  .np{display:block;height:auto;min-height:0}
+  .np[data-pane="editor"] .np-list{display:none}
+  .np[data-pane="list"] .np-editor{display:none}
+  .np-list{background:transparent;border:0;border-radius:0;overflow:visible}
+  .np-list-head{padding:0 0 10px;border:0}
+  .np-items{padding:0;overflow:visible}
+  .np-item{padding:12px 10px;background:var(--card);border:1px solid var(--border);margin-bottom:8px}
+  .np-group{padding:10px 2px 6px}
+  .np-back{display:inline-flex;margin-left:-8px}
+  .np-editor{height:calc(100vh - var(--topbar-h) - var(--tabbar-h) - 56px);height:calc(100dvh - var(--topbar-h) - var(--safe-t) - var(--tabbar-h) - var(--safe-b) - 56px);min-height:360px}
+  .np-title{font-family:var(--font);font-size:18px;font-weight:700;letter-spacing:0}
+  .np-vis{padding:4px 6px}
+  .np-vis>span:not(.ico){display:none}
+  .np-head{gap:2px;padding-bottom:10px}
+  .np-status>span:not(.ico){display:none}
+  .np-status{padding:6px}
+  .np-text{padding:18px 16px;font-size:16px}
+  .np-hint{display:none}
+}
+@media (prefers-reduced-motion:reduce){.np-status.saving .ico{animation:none}}

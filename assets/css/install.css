@@ -1,0 +1,51 @@
+/* FastTransfer installer — same design language as the sign-in page, in the default Champagne palette. */
+:root{--bg:#0c0c0f;--card:rgba(255,255,255,.05);--border:rgba(255,255,255,.08);--border2:rgba(255,255,255,.14);--accent:#d6b37a;--accent2:#f1dba8;--accent-g:linear-gradient(135deg,#ecd3a0,#c9a063);--accent-text:#dcbd85;--on-accent:#1b150b;--accent-rgb:214,179,122;--text:#ece9e3;--muted:#a19d94;--green:#34d399;--red:#f87171;--yellow:#fbbf24}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'DM Sans',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:24px 16px 48px;line-height:1.55}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 80% 60% at 50% -10%,rgba(var(--accent-rgb),.2),transparent);pointer-events:none}
+a{color:var(--accent-text)}
+.wrap{max-width:640px;margin:0 auto;position:relative}
+.brand{display:flex;align-items:center;gap:14px;margin:8px 0 22px}
+.logo{width:48px;height:48px;border-radius:14px;background:var(--accent-g);display:flex;align-items:center;justify-content:center;font-size:22px;flex:none;color:transparent;text-shadow:0 0 0 var(--on-accent);box-shadow:inset 0 1px 0 rgba(255,255,255,.3),0 8px 24px rgba(var(--accent-rgb),.25)}
+h1{font-family:'Syne',sans-serif;font-weight:800;font-size:24px}
+h2{font-family:'Syne',sans-serif;font-weight:700;font-size:19px;margin-bottom:10px}
+h3{font-size:15px;margin:18px 0 8px}
+.sub,.hint,small{color:var(--muted)}
+small{font-size:12px}
+p{margin-bottom:12px}
+code{background:rgba(255,255,255,.08);padding:1px 6px;border-radius:6px;font-size:.92em}
+.card{background:var(--card);backdrop-filter:blur(20px);border:1px solid var(--border);border-radius:18px;padding:24px;margin-bottom:16px;box-shadow:0 24px 48px rgba(0,0,0,.35)}
+.steps{list-style:none;display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
+.steps li{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);padding:6px 10px;border:1px solid var(--border);border-radius:999px}
+.steps li span{width:18px;height:18px;border-radius:50%;background:rgba(255,255,255,.08);display:inline-flex;align-items:center;justify-content:center;font-size:11px}
+.steps li.now{color:var(--text);border-color:var(--accent)}
+.steps li.now span{background:var(--accent-g);color:var(--on-accent)}
+.steps li.done{color:var(--green)}
+.steps li.done span{background:rgba(52,211,153,.2)}
+.msg{padding:12px 14px;border-radius:12px;margin-bottom:14px;font-size:14px}
+.msg.ok{background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.3);color:#a7f3d0}
+.msg.err{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);color:#fecaca}
+.form{display:flex;flex-direction:column;gap:12px}
+label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted);font-weight:500}
+label.check{flex-direction:row;align-items:flex-start;gap:10px;color:var(--text);font-weight:400}
+label.check input{margin-top:3px;width:18px;height:18px;accent-color:var(--accent);flex:none}
+input[type=text],input[type=password],input[type=email],input:not([type]){width:100%;padding:12px 14px;min-height:44px;background:rgba(255,255,255,.04);border:1px solid var(--border2);border-radius:11px;color:var(--text);font-size:15px;outline:none}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(var(--accent-rgb),.18)}
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:12px 20px;border:0;border-radius:11px;background:var(--accent-g);color:var(--on-accent);box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 4px 14px rgba(var(--accent-rgb),.22);font-size:15px;font-weight:600;cursor:pointer;text-decoration:none}
+.btn:hover{opacity:.92}
+.btn.ghost{background:transparent;border:1px solid var(--border2);color:var(--text);box-shadow:none}
+.btn:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--accent2);outline-offset:2px}
+.actions{margin-top:6px}
+.code{background:rgba(0,0,0,.35);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12.5px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;margin-bottom:12px;user-select:all}
+.todo{margin-top:18px;padding:14px;border:1px solid rgba(251,191,36,.3);background:rgba(251,191,36,.07);border-radius:12px;font-size:13.5px}
+.todo ul{margin:8px 0 0 18px}
+.todo li{margin-bottom:4px}
+.checks summary{cursor:pointer;font-weight:600}
+.checklist{list-style:none;margin-top:12px;display:flex;flex-direction:column;gap:6px;font-size:13.5px}
+.checklist li{display:flex;gap:10px}
+.checklist .mark{width:20px;flex:none;font-weight:700}
+.checklist .ok .mark{color:var(--green)}
+.checklist .bad .mark{color:var(--red)}
+.checklist .warn .mark{color:var(--yellow)}
+@media (max-width:480px){.card{padding:18px;border-radius:16px}h1{font-size:21px}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
